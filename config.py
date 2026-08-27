@@ -23,8 +23,12 @@ class EnvConfig:
     seed: int = 0
     # "regression" (least squares) | "logistic" (binary CE) | "mlp" (small neural net)
     task: str = "regression"
-    victim_hidden: int = 4     # mlp task: hidden width of the victim network
+    victim_hidden: int = 8     # mlp task: hidden width of the victim network
     init_scale: float = 0.3    # mlp task: std of the victim's initial weights
+    target_scale: float = 1.0  # mlp task: std of the attacker's target weights
+                                # (bigger than init_scale so f(.;theta_target) is
+                                # visibly non-linear -- small weights keep tanh
+                                # in its near-linear regime)
 
 
 @dataclass

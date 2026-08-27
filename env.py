@@ -21,6 +21,8 @@ class Stream:
     task="regression": y = <x, theta_star> + noise*N(0,1)      (real-valued)
     task="logistic"  : y ~ Bernoulli(sigmoid(<x, theta_star>)) (binary), then each
                        label is flipped with probability `noise`.
+    task="mlp"       : y = sin(<x, theta_star>) + noise*N(0,1) (real-valued, non-linear
+                       target -- gives the MLP victim something a linear model can't fit).
     """
 
     def __init__(self, cfg):
@@ -38,6 +40,8 @@ class Stream:
             if self.noise > 0:                                   # symmetric label flips
                 flip = torch.rand(m, generator=rng) < self.noise
                 y = torch.where(flip, 1.0 - y, y)
+        elif self.task == "mlp":
+            y = torch.sin(x @ self.theta_star) + self.noise * torch.randn(m, generator=rng)
         else:
             y = x @ self.theta_star + self.noise * torch.randn(m, generator=rng)
         return (x, y)
@@ -142,9 +146,11 @@ class Environment:
             self.victim = MLPVictim(env_cfg)
             self.d = self.victim.D                       # theta lives in parameter space
             # a zero start is degenerate for an MLP (symmetric, zero gradient), so the
-            # episode starts from a small random init; the target is on the same scale.
+            # episode starts from a small random init; the target uses a larger scale
+            # so f(.;theta_target) is visibly non-linear (small weights keep tanh in
+            # its near-linear regime).
             self.theta_0 = env_cfg.init_scale * torch.randn(self.d, generator=g)
-            self.theta_target = env_cfg.init_scale * torch.randn(self.d, generator=g)
+            self.theta_target = env_cfg.target_scale * torch.randn(self.d, generator=g)
         else:
             self.victim = Victim(env_cfg)
             self.d = env_cfg.d
