@@ -7,6 +7,7 @@ The decomposition is used for action *selection* only, never for bootstrapping:
 TD targets use V_hat(theta_{t+1}) evaluated directly.
 """
 import copy
+import time
 
 import torch
 
@@ -55,16 +56,26 @@ def eps_schedule(k, K, e0, e1):
     return e0 + (e1 - e0) * (k / max(1, K - 1))
 
 
-def rollout(env, agent, rng, epsilon=0.0):
+def rollout(env, agent, rng, epsilon=0.0, decision_times=None):
     """One episode. Returns (transitions, total_cost).
 
     transition = (theta_t, t, cost_t, theta_{t+1}).
+
+    If decision_times is a list, each step's agent.act() wall-clock time (seconds) is
+    appended to it -- used by run.py's evaluate() to report decision latency alongside
+    training time. Left None during training rollouts so the hot loop pays no timing
+    overhead there.
     """
     transitions, total = [], 0.0
     theta = env.theta_0.clone()
     for t in range(env.T):
         z = env.stream.sample_batch(env.m, rng)
-        a = agent.act(theta, z, t, epsilon=epsilon)
+        if decision_times is None:
+            a = agent.act(theta, z, t, epsilon=epsilon)
+        else:
+            t0 = time.perf_counter()
+            a = agent.act(theta, z, t, epsilon=epsilon)
+            decision_times.append(time.perf_counter() - t0)
         theta_next = env.victim.update(theta, z, a)
         c = env.cost(theta, z, a, theta_next)
         transitions.append((theta.detach(), t, c, theta_next.detach()))
@@ -79,7 +90,8 @@ def evaluate(env, agent, rng, n_episodes=100):
 
 
 def train_fvi(env, cfg, seed=0, verbose=True, return_history=False,
-              best_checkpoint=False, ema_decay=None, eval_episodes=100, eval_seed=999):
+              best_checkpoint=False, ema_decay=None, eval_episodes=100, eval_seed=999,
+              device="cpu"):
     """Train V_hat by FVI.
 
     If return_history, also evaluate the method policy on a FIXED held-out set of
@@ -95,6 +107,13 @@ def train_fvi(env, cfg, seed=0, verbose=True, return_history=False,
     of the weights across gradient steps and RETURN that averaged network. Averaging the
     SGD iterates lowers the variance of the estimate and smooths V_hat (and its curvature),
     which shrinks the Hessian part of B. ema_decay takes precedence over best_checkpoint.
+
+    device only affects the batched TD-fit step (2): rollout collection and the
+    decomposition's per-point Hessian (agents.py -> decomposition.py, m tiny autograd
+    calls per rollout step) always run on CPU regardless of `device` -- that path is
+    dispatch-overhead-bound, not throughput-bound, so a GPU is not expected to help
+    there. V_psi is moved to `device` only for step 2's batched grad steps (measured
+    ~4x faster on MPS for this shape) and moved back to CPU before the next rollout.
     """
     rng = torch.Generator().manual_seed(seed)
     V_psi = ValueNet(env.d, env.T, cfg.hidden)
@@ -114,9 +133,16 @@ def train_fvi(env, cfg, seed=0, verbose=True, return_history=False,
         buffer.push(transitions)                 # accumulate across iterations
 
         # --- 2. fit V_hat on TD targets (frozen label net) sampled from the buffer ---
+        if device != "cpu":
+            V_psi.to(device)
+            if ema is not None:
+                ema.to(device)
         V_target = copy.deepcopy(V_psi)          # DQN-style, refreshed each fit round
         for _ in range(cfg.n_grad_steps):
             theta_b, t_b, c_b, theta_next_b = buffer.sample(cfg.batch_size, rng)
+            if device != "cpu":
+                theta_b, t_b = theta_b.to(device), t_b.to(device)
+                c_b, theta_next_b = c_b.to(device), theta_next_b.to(device)
             with torch.no_grad():
                 y = c_b + V_target(theta_next_b, t_b + 1)   # 0 if t+1 == T
             pred = V_psi(theta_b, t_b)
@@ -128,6 +154,10 @@ def train_fvi(env, cfg, seed=0, verbose=True, return_history=False,
                 with torch.no_grad():
                     for pe, p in zip(ema.parameters(), V_psi.parameters()):
                         pe.mul_(ema_decay).add_(p, alpha=1.0 - ema_decay)
+        if device != "cpu":
+            V_psi.to("cpu")                      # back to CPU for rollout / decomposition
+            if ema is not None:
+                ema.to("cpu")
 
         if verbose or return_history or best_checkpoint:
             # fixed held-out eval set (same batches every iteration)

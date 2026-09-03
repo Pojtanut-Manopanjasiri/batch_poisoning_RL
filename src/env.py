@@ -1,22 +1,7 @@
-"""Environment and victim (reconstructed minimal Brief I).
-
-State  s_t = (theta_t, z_t),  theta in R^d,  batch z of m i.i.d. points.
-Action a in {0,1,2}^m   (0 delete, 1 keep, 2 duplicate).
-
-Transition is action-linear (the whole decomposition rests on this):
-
-    theta_{t+1} = theta_t + sum_i a_i * phi_i ,   phi_i = -(eta/m) grad_theta l_i .
-
-Cost (minimisation, ZZL convention):
-
-    g = c_edit * sum_i |a_i - 1|            (perturbation / total-variation)
-      + (lam/2) * ||theta_{t+1} - theta_target||^2   (nefarious)
-"""
 import torch
 
-
 class Stream:
-    """I.i.d. data stream P_Z: z = (x, y), x ~ N(0, I_d).
+    """iid. data stream P_Z: z = (x, y), x ~ N(0, I_d).
 
     task="regression": y = <x, theta_star> + noise*N(0,1)      (real-valued)
     task="logistic"  : y ~ Bernoulli(sigmoid(<x, theta_star>)) (binary), then each
@@ -146,11 +131,13 @@ class Environment:
             self.victim = MLPVictim(env_cfg)
             self.d = self.victim.D                       # theta lives in parameter space
             # a zero start is degenerate for an MLP (symmetric, zero gradient), so the
-            # episode starts from a small random init; the target uses a larger scale
-            # so f(.;theta_target) is visibly non-linear (small weights keep tanh in
-            # its near-linear regime).
+            # episode starts from a small random init.
             self.theta_0 = env_cfg.init_scale * torch.randn(self.d, generator=g)
-            self.theta_target = env_cfg.target_scale * torch.randn(self.d, generator=g)
+           
+            probe = torch.cat([self.victim.phi_batch(
+                self.theta_0, self.stream.sample_batch(env_cfg.m, g)) for _ in range(2)])
+            direction = torch.randn(probe.shape[0], generator=g) @ probe
+            self.theta_target = self.theta_0 + env_cfg.target_scale * direction / direction.norm()
         else:
             self.victim = Victim(env_cfg)
             self.d = env_cfg.d

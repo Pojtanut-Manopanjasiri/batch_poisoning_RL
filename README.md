@@ -18,32 +18,48 @@ rests on. Swapping in a different victim only requires a new `phi_batch`.
 
 ## Files
 
+All Python modules live under `src/`; run scripts and notebooks stay at the repo
+root and reach them by relative path (`python src/run.py`, `sys.path.insert(0,
+"src")` in each notebook's first cell) so `output/`/`results/` still land at the
+repo root regardless of where a run is launched from.
+
 | file | contents |
 |------|----------|
-| `config.py`        | `EnvConfig`, `MethodConfig` (Brief II §6) |
-| `env.py`           | `Stream`, `Victim`, `Environment`, feasibility helpers (Brief I) |
-| `value_net.py`     | `ValueNet` — `V_hat(theta, t)`, terminal masking (§4.1) |
-| `decomposition.py` | `scores_and_interaction` — alpha, B via autodiff (§3–4.2) |
-| `selection.py`     | `select_action` — `sort` / `lowrank` / `exact` (§4.3) |
-| `agents.py`        | baselines (null/random/greedy) + `MethodAgent` |
-| `fvi.py`           | fitted value iteration loop + rollout/evaluate (§4.1) |
-| `bdq.py`           | **BDQ baseline** — branching dueling Q-network (external comparison) |
-| `diagnostics.py`   | `interaction_diagnostics` + the three figures (§5) |
-| `viz.py`           | plots: training curve, cost-vs-budget, cost-vs-dimension (overall and by tier), duality gap, weight-decay sweep, per-policy action map, (d=1) regression-line attack, and (d>1) parameter-space attack |
-| `run.py`           | end-to-end: train, compare to baselines, make figures |
-| `experiment.ipynb` | notebook: trains, compares baselines, all diagnostics, and the d=1 regression-line demo |
+| `src/config.py`        | `EnvConfig`, `MethodConfig` (Brief II §6) |
+| `src/env.py`           | `Stream`, `Victim`, `Environment`, feasibility helpers (Brief I) |
+| `src/value_net.py`     | `ValueNet` — `V_hat(theta, t)`, terminal masking (§4.1) |
+| `src/decomposition.py` | `scores_and_interaction` — alpha, B via autodiff (§3–4.2) |
+| `src/selection.py`     | `select_action` — `sort` / `lowrank` / `exact` (§4.3) |
+| `src/agents.py`        | baselines (null/random/greedy) + `MethodAgent` |
+| `src/fvi.py`           | fitted value iteration loop + rollout/evaluate (§4.1) |
+| `src/bdq.py`           | **BDQ baseline** — branching dueling Q-network (external comparison) |
+| `src/trpo.py`, `src/ppo.py` | policy-gradient baselines (TRPO kept; PPO dropped, see below) |
+| `src/diagnostics.py`   | `interaction_diagnostics` + the three figures (§5) |
+| `src/viz.py`           | plots: training curve, cost-vs-budget, cost-vs-dimension (overall and by tier), duality gap, weight-decay sweep, per-policy action map, (d=1) regression-line attack, and (d>1) parameter-space attack |
+| `src/run.py`           | one (task, mode, seed) run: train, compare to baselines, save `results.json` |
+| `src/aggregate.py`     | folds every seed's `results.json` for one (task, mode) into one timestamped summary |
+| `run_seeds.sh`, `sweep.sh` | terminal entry points: many seeds / a full task×mode×seed grid |
+| `experiment_linear.ipynb`, `experiment_nn.ipynb`, `experiment_logistic.ipynb` | notebooks that load `output/*_results_*.json` and plot |
+| `experiment.ipynb` | original single-file notebook: trains live, compares baselines, all diagnostics, and the d=1 regression-line demo |
 
 ## Run
 
+From the terminal (writes `output/<task>_<mode>_seed<seed>_<timestamp>/results.json`):
+
 ```bash
-python run.py                       # sort selection (default)
-python run.py --mode lowrank --rank 2
-python run.py --mode exact          # BQP; brute force here (no Gurobi installed)
-python run.py --no-hessian          # Gram-only ablation for B
+python src/run.py                       # sort selection (default), task=regression
+python src/run.py --mode lowrank --rank 2
+python src/run.py --mode exact          # BQP; brute force here (no Gurobi installed)
+python src/run.py --no-hessian          # Gram-only ablation for B
+python src/run.py --diagnostics         # also writes fig1_spectrum.png, fig2_rel_interaction.png, fig3_tiers.png
+
+./run_seeds.sh --task linear --seeds 10 --mode sort     # many seeds, auto-aggregated
+./sweep.sh                                               # full task x mode x seed grid
 ```
 
-Outputs mean episode cost for null/random/greedy/method and writes
-`fig1_spectrum.png`, `fig2_rel_interaction.png`, `fig3_tiers.png`.
+Outputs mean episode cost for null/random/greedy/method (+ BDQ/TRPO with `--bdq`/`--trpo`).
+`run_seeds.sh -h` / `sweep.sh` header comments document every flag, including the
+sensitivity-analysis overrides (`--m`, `--T`, `--eta`, `--c-edit`, ...).
 
 ## What to look for
 

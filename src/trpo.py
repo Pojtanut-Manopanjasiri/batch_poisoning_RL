@@ -177,23 +177,33 @@ class TRPOAgent:
         if epsilon > 0 and float(torch.rand(1, generator=self.rng)) < epsilon:
             return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.k_max)
         err, phi, resid = _features(self.env, theta, z)
-        rl, ds, us = self.policy(theta[None], err[None], torch.tensor([t]),
-                                 phi[None], resid[None])
+        device = next(self.policy.parameters()).device
+        rl, ds, us = self.policy(theta[None].to(device), err[None].to(device),
+                                 torch.tensor([t], device=device),
+                                 phi[None].to(device), resid[None].to(device))
+        # sample_swaps/greedy_swaps use a CPU-only rng (torch.multinomial requires the
+        # generator and the sampled tensor on the same device) -- bring logits back.
+        rl, ds, us = rl[0].cpu(), ds[0].cpu(), us[0].cpu()
         if self.deterministic:
-            return greedy_swaps(rl[0], ds[0], us[0])
-        return sample_swaps(rl[0], ds[0], us[0], self.max_r, self.rng)[0]
+            return greedy_swaps(rl, ds, us)
+        return sample_swaps(rl, ds, us, self.max_r, self.rng)[0]
 
 
 def _rollout_trpo(env, policy, critic, cfg, rng, max_r):
     recs, total = [], 0.0
     theta = env.theta_0.clone()
+    device = next(policy.parameters()).device
     for t in range(env.T):
         z = env.stream.sample_batch(env.m, rng)
         err, phi, resid = _features(env, theta, z)
-        tt = torch.tensor([t])
+        tt = torch.tensor([t], device=device)
         with torch.no_grad():
-            rl, ds, us = policy(theta[None], err[None], tt, phi[None], resid[None])
-            v = critic(theta[None], err[None], tt, phi[None], resid[None])
+            rl, ds, us = policy(theta[None].to(device), err[None].to(device), tt,
+                                phi[None].to(device), resid[None].to(device))
+            v = critic(theta[None].to(device), err[None].to(device), tt,
+                      phi[None].to(device), resid[None].to(device))
+        # sample_swaps needs CPU tensors (its rng is a CPU-only torch.Generator)
+        rl, ds, us, v = rl.cpu(), ds.cpu(), us.cpu(), v.cpu()
         a, logp, r, di, ui = sample_swaps(rl[0], ds[0], us[0], max_r, rng)
         theta_next = env.victim.update(theta, z, a)
         c = env.cost(theta, z, a, theta_next)
@@ -208,16 +218,21 @@ def _rollout_trpo(env, policy, critic, cfg, rng, max_r):
 
 
 def train_trpo(env, cfg, seed=0, verbose=True, return_history=False,
-               best_checkpoint=False, eval_episodes=100, eval_seed=999):
+               best_checkpoint=False, eval_episodes=100, eval_seed=999, device="cpu"):
     """Train a TRPO swap-policy. Signature matches train_fvi / train_bdq / train_ppo.
 
     Like PPO this is ON-policy: we match ENVIRONMENT INTERACTIONS (K_iters * N_episodes)
     with the replay-based learners and let gradient-step counts differ.
+
+    Like BDQ, policy/critic can live on `device` for the whole run (rollout-time calls
+    are plain no_grad forward passes -- _rollout_trpo/TRPOAgent.act cross devices
+    transparently, bringing outputs back to CPU before sample_swaps/greedy_swaps, which
+    need a CPU-only rng).
     """
     rng = torch.Generator().manual_seed(seed)
     max_r = max_swaps(env.m, cfg.k_max)
-    policy = SwapPolicy(env.d, env.T, max_r, cfg.hidden)
-    critic = StateValue(env.d, env.T, cfg.hidden)
+    policy = SwapPolicy(env.d, env.T, max_r, cfg.hidden).to(device)
+    critic = StateValue(env.d, env.T, cfg.hidden).to(device)
     vopt = torch.optim.Adam(critic.parameters(), lr=cfg.trpo_vf_lr,
                             weight_decay=cfg.weight_decay)
     params = list(policy.parameters())
@@ -241,6 +256,10 @@ def train_trpo(env, cfg, seed=0, verbose=True, return_history=False,
         adv = torch.tensor([r["adv"] for r in batch], dtype=torch.float32)
         ret = torch.tensor([r["ret"] for r in batch], dtype=torch.float32)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        if device != "cpu":
+            (th_b, er_b, t_b, ph_b, rs_b, r_b, di_b, ui_b, lp_old, adv, ret) = (
+                x.to(device) for x in
+                (th_b, er_b, t_b, ph_b, rs_b, r_b, di_b, ui_b, lp_old, adv, ret))
 
         with torch.no_grad():                      # frozen reference distribution
             old = tuple(x.detach() for x in
@@ -287,7 +306,12 @@ def train_trpo(env, cfg, seed=0, verbose=True, return_history=False,
 
         # --- fit the critic (plain regression, outside the trust region) ---
         for _ in range(cfg.trpo_vf_iters):
+            # rng is CPU-only, so the permutation is drawn on CPU then moved to index
+            # the (possibly device-resident) batch tensors -- doesn't affect the actual
+            # random draw, just where the resulting indices live.
             perm = torch.randperm(len(batch), generator=rng)[:cfg.ppo_minibatch]
+            if device != "cpu":
+                perm = perm.to(device)
             v = critic(th_b[perm], er_b[perm], t_b[perm], ph_b[perm], rs_b[perm])
             vloss = ((v - ret[perm]) ** 2).mean()
             vopt.zero_grad()

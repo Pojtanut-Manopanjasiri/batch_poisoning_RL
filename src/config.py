@@ -25,10 +25,9 @@ class EnvConfig:
     task: str = "regression"
     victim_hidden: int = 8     # mlp task: hidden width of the victim network
     init_scale: float = 0.3    # mlp task: std of the victim's initial weights
-    target_scale: float = 1.0  # mlp task: std of the attacker's target weights
-                                # (bigger than init_scale so f(.;theta_target) is
-                                # visibly non-linear -- small weights keep tanh
-                                # in its near-linear regime)
+    target_scale: float = 2.0  # mlp task: how far theta_target sits from theta_0, along a
+                                # direction built from real per-sample gradients (env.py) --
+                                # NOT a raw parameter-space norm (see env.py's construction)
 
 
 @dataclass

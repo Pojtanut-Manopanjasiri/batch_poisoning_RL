@@ -102,9 +102,14 @@ def _features(env, theta, z):
 
 
 def _q_values(net, env, theta, z, t):
-    """Q for a single state -> (m, 3)."""
+    """Q for a single state -> (m, 3). Crosses to net's device and back transparently,
+    so callers (BDQAgent.act, used both mid-rollout and at eval) never need to know
+    whether net was trained with device="cpu" or a GPU."""
+    device = next(net.parameters()).device
     err, phi, resid = _features(env, theta, z)
-    return net(theta[None], err[None], torch.tensor([t]), phi[None], resid[None])[0]
+    q = net(theta[None].to(device), err[None].to(device), torch.tensor([t], device=device),
+            phi[None].to(device), resid[None].to(device))[0]
+    return q.cpu()
 
 
 # --------------------------------------------------------------------------- #
@@ -210,12 +215,18 @@ def _stack(env, batch):
 
 
 def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
-              best_checkpoint=True, eval_episodes=100, eval_seed=999):
-    """Train BDQ. Same outer loop / budget as train_fvi, so the comparison is fair."""
+              best_checkpoint=True, eval_episodes=100, eval_seed=999, device="cpu"):
+    """Train BDQ. Same outer loop / budget as train_fvi, so the comparison is fair.
+
+    Unlike FVI, net can live on `device` for the whole run: rollout-time calls
+    (BDQAgent.act -> _q_values) are plain no_grad forward passes, not a repeated
+    per-point autograd loop, so there's no reason to bounce it back to CPU between
+    fit blocks -- _q_values crosses devices transparently either way.
+    """
     from fvi import eps_schedule, evaluate
 
     rng = torch.Generator().manual_seed(seed)
-    net = BranchQNet(env.d, env.T, cfg.hidden)
+    net = BranchQNet(env.d, env.T, cfg.hidden).to(device)
     agent = BDQAgent(net, env, cfg, rng)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     buffer = BDQBuffer(cfg.buffer_capacity)
@@ -243,6 +254,10 @@ def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
         for _ in range(cfg.n_grad_steps):
             (th, err, phi, res, t, a, c,
              th_n, err_n, phi_n, res_n, done) = _stack(env, buffer.sample(cfg.batch_size, rng))
+            if device != "cpu":
+                (th, err, phi, res, t, a, c, th_n, err_n, phi_n, res_n, done) = (
+                    x.to(device) for x in
+                    (th, err, phi, res, t, a, c, th_n, err_n, phi_n, res_n, done))
 
             with torch.no_grad():
                 q_next_online = net(th_n, err_n, t + 1, phi_n, res_n)      # double-Q
