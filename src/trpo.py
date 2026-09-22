@@ -1,15 +1,27 @@
 """TRPO baseline for batch-curation poisoning.
 
-Same swap-policy parameterisation as `ppo.py` (see its module docstring for why a policy
-over delete/duplicate SWAPS, rather than a factored per-point categorical + projection, is
-what makes a policy-gradient method work under the `balance` constraint). TRPO replaces
-PPO's clipped surrogate with a hard trust region:
+A policy over delete/duplicate SWAPS, in the coordinates the batch-size constraint is
+written in.  This covers a_i in {0,1,2} only, i.e. L = 2:
+
+    r          ~ Categorical(r_logits)                how many swaps, r <= max_r
+    del_1..r   ~ sequential softmax over del_scores   r deletes, without replacement
+    dup_1..r   ~ sequential softmax over dup_scores   r duplicates, disjoint from those
+
+This Plackett-Luce draw gives feasibility BY CONSTRUCTION (no projection), an EXACT
+log-prob that telescopes into a sum, and O(m) sampling from a space of size 3^m.
+
+The obvious alternative -- a factored per-point categorical projected onto the feasible
+set -- fails: with `balance`, flipping one point to "delete" does nothing until a matching
+duplicate appears, so the projection erases single-coordinate changes and the policy
+gradient sits on a plateau.
+
+The update maximises an importance-weighted surrogate under a hard KL trust region:
 
     maximise  E[ pi_new(u|s)/pi_old(u|s) * A(s,u) ]   s.t.  KL(pi_old || pi_new) <= delta
 
 solved by a natural-gradient step: conjugate gradient against the Fisher-vector product,
 then a backtracking line search that enforces both the KL bound and actual improvement.
-Like PPO it never needs max_a Q(s,a) -- the critic is a state value V(s).
+It never needs max_a Q(s,a) -- the critic is a state value V(s).
 
 The KL for a Plackett-Luce policy
 ---------------------------------
@@ -29,6 +41,7 @@ Masked entries use a finite NEG (not -inf) so that p_old * (logp_old - logp_new)
 to ~0 instead of nan.
 """
 import copy
+import warnings
 
 import torch
 import torch.nn as nn
@@ -36,11 +49,116 @@ import torch.nn as nn
 from bdq import _features
 from env import random_feasible_action
 from fvi import evaluate
-from ppo import NEG, _gae, _mlp, greedy_swaps, logp_swaps, max_swaps, sample_swaps
+
+
+# --------------------------------------------------------------------------- #
+# swap policy: feasible-by-construction Plackett-Luce over delete/duplicate pairs
+# --------------------------------------------------------------------------- #
+NEG = -1e9          # mask value; finite so log_softmax never yields nan
+
+
+def _mlp(sizes):
+    layers = []
+    for i in range(len(sizes) - 1):
+        layers.append(nn.Linear(sizes[i], sizes[i + 1]))
+        if i < len(sizes) - 2:
+            layers.append(nn.Tanh())
+    return nn.Sequential(*layers)
+
+
+def max_swaps(m, B=None):
+    r = m // 2
+    return r if B is None else min(r, B // 2)
+
+
+def _draw(scores, avail, rng):
+    """One masked-softmax draw without replacement. Returns (index, logprob)."""
+    lp = torch.log_softmax(scores.masked_fill(~avail, NEG), dim=-1)
+    i = int(torch.multinomial(lp.exp(), 1, generator=rng))
+    return i, lp[i]
+
+
+def sample_swaps(r_logits, del_s, dup_s, max_r, rng):
+    """Plackett-Luce draw. Returns (a, logp, r, del_idx, dup_idx) with a feasible."""
+    m = del_s.shape[0]
+    lp_r = torch.log_softmax(r_logits, dim=-1)
+    r = int(torch.multinomial(lp_r.exp(), 1, generator=rng))
+    logp = lp_r[r]
+
+    avail = torch.ones(m, dtype=torch.bool)
+    del_idx, dup_idx = [], []
+    for _ in range(r):                                  # deletes
+        i, lp = _draw(del_s, avail, rng)
+        del_idx.append(i); avail[i] = False; logp = logp + lp
+    for _ in range(r):                                  # duplicates, disjoint
+        i, lp = _draw(dup_s, avail, rng)
+        dup_idx.append(i); avail[i] = False; logp = logp + lp
+
+    a = torch.ones(m)
+    for i in del_idx:
+        a[i] = 0.0
+    for i in dup_idx:
+        a[i] = 2.0
+    return a, logp, r, del_idx, dup_idx
+
+
+def logp_swaps(r_logits, del_s, dup_s, r, del_idx, dup_idx, max_r):
+    """Exact log-prob of stored ordered draws, batched.
+
+    r (B,) long; del_idx/dup_idx (B, max_r) padded with -1. Replays the same sequential
+    masking used at sampling time, so the importance ratio is exact.
+    """
+    B, m = del_s.shape
+    logp = torch.log_softmax(r_logits, -1).gather(1, r[:, None]).squeeze(1)
+    avail = torch.ones(B, m, dtype=torch.bool, device=del_s.device)
+    for scores, idx in ((del_s, del_idx), (dup_s, dup_idx)):
+        for j in range(max_r):
+            active = idx[:, j] >= 0                     # rows that made a j-th draw
+            if not bool(active.any()):
+                continue
+            lp = torch.log_softmax(scores.masked_fill(~avail, NEG), dim=-1)
+            pick = idx[:, j].clamp(min=0)
+            step = lp.gather(1, pick[:, None]).squeeze(1)
+            logp = logp + torch.where(active, step, torch.zeros_like(step))
+            hit = torch.nn.functional.one_hot(pick, m).bool() & active[:, None]
+            avail = avail & ~hit
+    return logp
+
+
+def greedy_swaps(r_logits, del_s, dup_s):
+    """Deterministic read used at evaluation: take the modal r, then its top-r scores."""
+    m = del_s.shape[0]
+    r = int(r_logits.argmax())
+    a = torch.ones(m)
+    if r == 0:
+        return a
+    order_del = torch.argsort(del_s, descending=True)
+    dels = order_del[:r]
+    mask = torch.ones(m, dtype=torch.bool)
+    mask[dels] = False
+    cand = torch.where(mask)[0]
+    dups = cand[torch.argsort(dup_s[cand], descending=True)[:r]]
+    a[dels] = 0.0
+    a[dups] = 2.0
+    return a
+
+
+# --------------------------------------------------------------------------- #
+# GAE
+# --------------------------------------------------------------------------- #
+def _gae(recs, gamma, lam):
+    adv, last = [0.0] * len(recs), 0.0
+    for i in reversed(range(len(recs))):
+        v_next = recs[i + 1]["v"] if i + 1 < len(recs) else 0.0   # terminal V = 0
+        last = recs[i]["reward"] + gamma * v_next - recs[i]["v"] + gamma * lam * last
+        adv[i] = last
+    for i, rec in enumerate(recs):
+        rec["adv"], rec["ret"] = adv[i], adv[i] + rec["v"]
+    return recs
 
 
 class SwapPolicy(nn.Module):
-    """Actor only (same architecture as ppo.ActorCritic minus the value head)."""
+    """Actor only: the swap-policy heads, no value head."""
 
     def __init__(self, d, T, max_r, hidden=(128, 128)):
         super().__init__()
@@ -169,13 +287,13 @@ class TRPOAgent:
     def __init__(self, policy, env, cfg, rng, deterministic=True):
         self.policy, self.env, self.cfg, self.rng = policy, env, cfg, rng
         self.deterministic = deterministic
-        self.max_r = max_swaps(env.m, cfg.k_max)
+        self.max_r = max_swaps(env.m, cfg.B)
 
     @torch.no_grad()
     def act(self, theta, z, t, epsilon=0.0):
         m = z[0].shape[0]
         if epsilon > 0 and float(torch.rand(1, generator=self.rng)) < epsilon:
-            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.k_max)
+            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B, self.cfg.L)
         err, phi, resid = _features(self.env, theta, z)
         rl, ds, us = self.policy(theta[None], err[None], torch.tensor([t]),
                                  phi[None], resid[None])
@@ -209,13 +327,16 @@ def _rollout_trpo(env, policy, critic, cfg, rng, max_r):
 
 def train_trpo(env, cfg, seed=0, verbose=True, return_history=False,
                best_checkpoint=False, eval_episodes=100, eval_seed=999):
-    """Train a TRPO swap-policy. Signature matches train_fvi / train_bdq / train_ppo.
+    """Train a TRPO swap-policy. Signature matches train_fvi / train_bdq.
 
-    Like PPO this is ON-policy: we match ENVIRONMENT INTERACTIONS (K_iters * N_episodes)
+    This is ON-policy: we match ENVIRONMENT INTERACTIONS (K_iters * N_episodes)
     with the replay-based learners and let gradient-step counts differ.
     """
     rng = torch.Generator().manual_seed(seed)
-    max_r = max_swaps(env.m, cfg.k_max)
+    if getattr(cfg, "L", 2) > 2:
+        warnings.warn(f"TRPO's swap policy only reaches a_i <= 2; at L={cfg.L} it is a "
+                      "restricted baseline and will look artificially weak.")
+    max_r = max_swaps(env.m, cfg.B)
     policy = SwapPolicy(env.d, env.T, max_r, cfg.hidden)
     critic = StateValue(env.d, env.T, cfg.hidden)
     vopt = torch.optim.Adam(critic.parameters(), lr=cfg.trpo_vf_lr,
@@ -287,7 +408,7 @@ def train_trpo(env, cfg, seed=0, verbose=True, return_history=False,
 
         # --- fit the critic (plain regression, outside the trust region) ---
         for _ in range(cfg.trpo_vf_iters):
-            perm = torch.randperm(len(batch), generator=rng)[:cfg.ppo_minibatch]
+            perm = torch.randperm(len(batch), generator=rng)[:cfg.trpo_minibatch]
             v = critic(th_b[perm], er_b[perm], t_b[perm], ph_b[perm], rs_b[perm])
             vloss = ((v - ret[perm]) ** 2).mean()
             vopt.zero_grad()

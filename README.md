@@ -20,26 +20,25 @@ rests on. Swapping in a different victim only requires a new `phi_batch`.
 
 | file | contents |
 |------|----------|
-| `config.py`        | `EnvConfig`, `MethodConfig` (Brief II §6) |
-| `env.py`           | `Stream`, `Victim`, `Environment`, feasibility helpers (Brief I) |
-| `value_net.py`     | `ValueNet` — `V_hat(theta, t)`, terminal masking (§4.1) |
-| `decomposition.py` | `scores_and_interaction` — alpha, B via autodiff (§3–4.2) |
-| `selection.py`     | `select_action` — `sort` / `lowrank` / `exact` (§4.3) |
-| `agents.py`        | baselines (null/random/greedy) + `MethodAgent` |
-| `fvi.py`           | fitted value iteration loop + rollout/evaluate (§4.1) |
-| `bdq.py`           | **BDQ baseline** — branching dueling Q-network (external comparison) |
-| `diagnostics.py`   | `interaction_diagnostics` + the three figures (§5) |
-| `viz.py`           | plots: training curve, cost-vs-budget, cost-vs-dimension (overall and by tier), duality gap, weight-decay sweep, per-policy action map, (d=1) regression-line attack, and (d>1) parameter-space attack |
-| `run.py`           | end-to-end: train, compare to baselines, make figures |
-| `experiment.ipynb` | notebook: trains, compares baselines, all diagnostics, and the d=1 regression-line demo |
+| `src/config.py`        | `EnvConfig`, `MethodConfig` (Brief II §6) |
+| `src/env.py`           | `Stream`, `Victim`, `Environment`, feasibility helpers (Brief I) |
+| `src/value_net.py`     | `ValueNet` — `V_hat(theta, t)`, terminal masking (§4.1) |
+| `src/decomposition.py` | `scores_and_interaction` — alpha, B via autodiff (§3–4.2) |
+| `src/selection.py`     | `select_action` — `greedy` (Alg. 2) / `exact` (§4.3) |
+| `src/agents.py`        | baselines (null/random/greedy) + `MethodAgent` |
+| `src/fvi.py`           | fitted value iteration loop + rollout/evaluate (§4.1) |
+| `src/bdq.py`           | **BDQ baseline** — branching dueling Q-network (external comparison) |
+| `src/diagnostics.py`   | `interaction_diagnostics` + the three figures (§5) |
+| `src/viz.py`           | plots: training curve, cost-vs-budget, cost-vs-dimension (overall and by tier), duality gap, weight-decay sweep, per-policy action map, (d=1) regression-line attack, and (d>1) parameter-space attack |
+| `src/run.py`           | end-to-end: train, compare to baselines, make figures |
+| `notebooks/experiment.ipynb` | notebook: trains, compares baselines, all diagnostics, and the d=1 regression-line demo |
 
 ## Run
 
 ```bash
-python run.py                       # sort selection (default)
-python run.py --mode lowrank --rank 2
-python run.py --mode exact          # BQP; brute force here (no Gurobi installed)
-python run.py --no-hessian          # Gram-only ablation for B
+python src/run.py                   # greedy (Alg. 2) selection (default)
+python src/run.py --mode exact      # BQP; brute force here (no Gurobi installed)
+python src/run.py --no-hessian      # Gram-only ablation for B
 ```
 
 Outputs mean episode cost for null/random/greedy/method and writes
@@ -49,15 +48,14 @@ Outputs mean episode cost for null/random/greedy/method and writes
 
 - **Spectrum (fig 1).** With `d < m`, exactly `m - d` eigenvalues of `B` are ~0
   (rank(B) ≤ min(m, d)); the cumulative trace fraction shows how few directions
-  carry the interaction — this motivates `lowrank`.
+  carry the interaction.
 - **Relative interaction (fig 2).** `|½ aᵀBa| / |aᵀα|` grows ~linearly in `eta`.
-- **Tier gap (fig 3).** `cost(exact) ≤ cost(lowrank) ≤ cost(sort)`. The gap is
+- **Tier gap (fig 3).** `cost(exact) ≤ cost(greedy)`. The gap is
   the price of ignoring the interaction — the headline result.
 
 Caveat on the fig-3 wall-clock panel: at small `m` the brute-force `exact` path
-uses a cached, vectorised enumerator and is very fast, so `lowrank`'s Python
-dual-ascent loop can look slower. With Gurobi and larger `m`, `exact` becomes the
-expensive tier.
+uses a cached, vectorised enumerator and is very fast. With Gurobi and larger
+`m`, `exact` becomes the expensive tier.
 
 ## External baseline: BDQ (action branching)
 
@@ -94,4 +92,4 @@ contribution analytically as `alpha_i` from the action-linear transition.
 ## Dependencies
 
 `torch`, `numpy`, `matplotlib`. `exact` uses Gurobi if `gurobipy` is installed,
-otherwise brute force for `m ≤ 12` (with a `lowrank` fallback and a warning).
+otherwise brute force for `m ≤ 12` (past that it raises rather than degrade silently).

@@ -1,7 +1,7 @@
 """Plotting helpers for the experiment.
 
 - plot_training_curves : method cost vs FVI iteration (training health).
-- cost_vs_budget       : attack cost vs the delete budget k_max.
+- cost_vs_budget       : attack cost vs the edit budget B.
 - plot_regression_attack : d=1 only -- how the victim's regression line moves under
   the attack (meaningful only for a single feature, where y = theta * x is a line).
 """
@@ -47,10 +47,10 @@ def plot_training_curves(history, baseline_costs, path,
 
 def cost_vs_budget(env_cfg, method_cfg, budgets, path, seed=0,
                    eval_episodes=100, eval_seed=999):
-    """Retrain + evaluate the method under each delete budget k_max, then plot cost vs budget.
+    """Retrain + evaluate the method under each edit budget B, then plot cost vs budget.
 
     The value function depends on the constraint, so the method is retrained with
-    k_max=b for each budget b. greedy is scored per budget too; null (no edits) is a
+    B=b for each budget b. greedy is scored per budget too; null (no edits) is a
     budget-independent reference. At budget 0 no edits are allowed, so method, greedy
     and null coincide. Returns the raw costs.
     """
@@ -63,7 +63,7 @@ def cost_vs_budget(env_cfg, method_cfg, budgets, path, seed=0,
     name = tier_name(method_cfg.select_mode)
     method_costs, greedy_costs, null_cost = [], [], None
     for b in budgets:
-        cfg_b = replace(method_cfg, k_max=int(b))
+        cfg_b = replace(method_cfg, B=int(b))
         torch.manual_seed(seed)
         env = Environment(env_cfg, cfg_b)
         V = train_fvi(env, cfg_b, seed=seed, verbose=False, best_checkpoint=True)
@@ -82,7 +82,7 @@ def cost_vs_budget(env_cfg, method_cfg, budgets, path, seed=0,
     ax.plot(budgets, method_costs, "o-", color="C0", lw=2, label=f"{name} (FVI)")
     ax.plot(budgets, greedy_costs, "s-", color="C1", lw=2, label="greedy")
     ax.axhline(null_cost, color="0.4", ls="--", lw=2, label=f"null / no attack ({null_cost:.2f})")
-    ax.set_xlabel("delete budget  k_max  (max #deletes = #duplicates)")
+    ax.set_xlabel("edit budget  B   (||a - 1||_1)")
     ax.set_ylabel("mean episode cost (lower = stronger attack)")
     ax.set_title("Attack cost vs edit budget")
     ax.set_xticks(budgets)
@@ -178,7 +178,7 @@ def cost_vs_dimension(env_cfg, method_cfg, ds, path, seeds=(0,),
             agents = {
                 "null": NullAgent(),
                 "random": RandomAgent(torch.Generator().manual_seed(s + 2),
-                                      method_cfg.balance, method_cfg.k_max),
+                                      method_cfg.balance, method_cfg.B, method_cfg.L),
                 "greedy": GreedyAgent(env.victim, env.theta_target, method_cfg,
                                       mode=method_cfg.select_mode),
                 name: MethodAgent(V, env.victim, env.theta_target, method_cfg,
@@ -224,11 +224,11 @@ def cost_vs_dimension(env_cfg, method_cfg, ds, path, seeds=(0,),
 
 
 def cost_vs_dimension_tiers(env_cfg, method_cfg, ds, path, seeds=(0,),
-                            eval_episodes=100, eval_seed=999, train_mode="sort",
+                            eval_episodes=100, eval_seed=999, train_mode="greedy",
                             metric="cost", normalize=None):
     """Sweep d; for each d train ONE value function (under train_mode) and evaluate that
-    SAME V_hat with each selection tier -- first-order / low-rank / exact. Isolates the
-    value of using the interaction B (low-rank/exact) over first-order, as a function of d.
+    SAME V_hat with each selection tier -- first-order / exact. Isolates the
+    value of using the interaction B (exact) over first-order, as a function of d.
     Keys of the returned dict are the display names, not the select_mode ids.
     Averaged over `seeds`. `metric` is 'cost' or 'gap' (mean ||theta_t - target||).
 
@@ -242,7 +242,7 @@ def cost_vs_dimension_tiers(env_cfg, method_cfg, ds, path, seeds=(0,),
     from fvi import train_fvi
     from agents import MethodAgent
 
-    ds, tiers = list(ds), ["sort", "lowrank", "exact"]
+    ds, tiers = list(ds), ["greedy", "exact"]
     labels = [tier_name(t) for t in tiers]        # display names, also the dict keys
     costs = {tier_name(t): [] for t in tiers}
     need_null = normalize in (True, "null")
@@ -270,11 +270,10 @@ def cost_vs_dimension_tiers(env_cfg, method_cfg, ds, path, seeds=(0,),
         if need_null:
             null_costs.append(float(np.mean(null_seed)))
 
-    sort = np.array(costs[tier_name("sort")])
+    sort = np.array(costs[tier_name("greedy")])
     vals, ylab, sub, logy = _normalize_dim_series(costs, labels, ds, metric, normalize,
                                                   null=null_costs)
-    styles = {"first-order": ("C0", "o", "-"), "low-rank": ("C1", "s", "--"),
-              "exact": ("C2", "^", "-.")}
+    styles = {"first-order": ("#2a78d6", "o", "-"), "exact": ("#e87ba4", "o", "-.")}
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(12, 4.5))
     for t in labels:
         c, mk, ls = styles[t]
@@ -288,7 +287,7 @@ def cost_vs_dimension_tiers(env_cfg, method_cfg, ds, path, seeds=(0,),
     axL.set_title(f"{label} by tier vs d ({sub}; shared V̂, trained w/ {tier_name(train_mode)})")
     axL.legend(fontsize=9)
 
-    for t in ["low-rank", "exact"]:                      # ratio -> normalisation-invariant
+    for t in ["exact"]:                                  # ratio -> normalisation-invariant
         c, mk, ls = styles[t]
         axR.plot(ds, (sort - np.array(costs[t])) / sort * 100, marker=mk, ls=ls,
                  color=c, lw=2, label=t)
@@ -303,53 +302,6 @@ def cost_vs_dimension_tiers(env_cfg, method_cfg, ds, path, seeds=(0,),
     if need_null:
         result["null"] = null_costs
     return result
-
-
-def plot_duality_gap(env, V_psi, cfg, path, rng, n_states=24, dual_iters=25):
-    """Low-rank dual-ascent duality gap vs iteration, over states the policy visits.
-
-    For each visited state we build (alpha, B) from V_psi and trace the gap across the
-    dual-ascent iterations (selection.lowrank_gap_trace). Plots each state's trace faint
-    plus the mean. The gap is non-increasing and plateaus at the residual integrality
-    gap of the (nonconvex) binary problem.
-    """
-    from decomposition import scores_and_interaction
-    from selection import lowrank_gap_trace, select_action
-
-    traces = []
-    while len(traces) < n_states:
-        theta = env.theta_0.clone()
-        for t in range(env.T):
-            z = env.stream.sample_batch(env.m, rng)
-            alpha, B = scores_and_interaction(V_psi, theta, z, t, env.victim,
-                                              env.theta_target, cfg.lam,
-                                              need_B=True, use_hessian=cfg.use_hessian_in_B)
-            traces.append(lowrank_gap_trace(alpha, B, c_edit=cfg.c_edit, k_max=cfg.k_max,
-                                            balance=cfg.balance, r=cfg.rank_r,
-                                            dual_iters=dual_iters))
-            a = select_action(alpha, B, cfg.select_mode, k_max=cfg.k_max, c_edit=cfg.c_edit,
-                              balance=cfg.balance, r=cfg.rank_r, dual_iters=cfg.dual_iters,
-                              solver=cfg.solver)
-            theta = env.victim.update(theta, z, a).detach()
-            if len(traces) >= n_states:
-                break
-
-    traces = np.array(traces)                       # (n_states, dual_iters)
-    iters = np.arange(1, traces.shape[1] + 1)
-    mean = traces.mean(0)
-
-    fig, ax = plt.subplots(figsize=(7.5, 4.5))
-    for tr in traces:
-        ax.plot(iters, tr, color="0.8", lw=0.8)
-    ax.plot(iters, mean, "o-", color="C0", lw=2.2, label="mean gap")
-    ax.set_xlabel("dual-ascent iteration")
-    ax.set_ylabel("duality gap  (primal − dual bound)")
-    ax.set_title(f"Low-rank selection: duality gap over iterations (r={cfg.rank_r})")
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-    return {"iters": iters.tolist(), "mean_gap": mean.tolist()}
 
 
 def plot_weight_decay_sweep(env_cfg, method_cfg, wds, path, seeds=(0,),
@@ -382,15 +334,15 @@ def plot_weight_decay_sweep(env_cfg, method_cfg, wds, path, seeds=(0,),
                 theta = env.theta_0.clone()
                 for t in range(env.T):
                     z = env.stream.sample_batch(env.m, rng)
-                    alpha, B = scores_and_interaction(V, theta, z, t, env.victim,
+                    alpha, Gamma = scores_and_interaction(V, theta, z, t, env.victim,
                                                       env.theta_target, cfg.lam,
-                                                      need_B=True, use_hessian=True)
-                    _, Bg = scores_and_interaction(V, theta, z, t, env.victim,
+                                                      need_Gamma=True, use_hessian=True)
+                    _, Gg = scores_and_interaction(V, theta, z, t, env.victim,
                                                    env.theta_target, cfg.lam,
-                                                   need_B=True, use_hessian=False)
-                    ratios.append(float((B - Bg).norm() / Bg.norm()))
+                                                   need_Gamma=True, use_hessian=False)
+                    ratios.append(float((Gamma - Gg).norm() / Gg.norm()))
                     theta = env.victim.update(
-                        theta, z, select_action(alpha, B, cfg.select_mode,
+                        theta, z, select_action(alpha, Gamma, cfg.select_mode,
                                                 c_edit=cfg.c_edit, balance=cfg.balance)).detach()
                     cnt += 1
                     if cnt >= n_hess_states:

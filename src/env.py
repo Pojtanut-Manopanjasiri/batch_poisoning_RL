@@ -1,7 +1,7 @@
 """Environment and victim (reconstructed minimal Brief I).
 
 State  s_t = (theta_t, z_t),  theta in R^d,  batch z of m i.i.d. points.
-Action a in {0,1,2}^m   (0 delete, 1 keep, 2 duplicate).
+Action a in {0,...,L}^m  (0 delete, 1 keep, l>1 duplicate l-1 times).
 
 Transition is action-linear (the whole decomposition rests on this):
 
@@ -169,28 +169,40 @@ class Environment:
 # --------------------------------------------------------------------------- #
 # Feasibility helpers (balance / budget)
 # --------------------------------------------------------------------------- #
-def is_feasible(a, balance=True, k_max=None):
-    n_del = int((a == 0).sum())
-    n_dup = int((a == 2).sum())
-    if balance and n_del != n_dup:
+def is_feasible(a, balance=True, B=None, L=2):
+    """a_i in {0,...,L};  sum_i a_i = m (balance);  ||a - 1||_1 <= B."""
+    if bool((a < 0).any()) or bool((a > L).any()):
         return False
-    if k_max is not None and n_del > k_max:
+    if balance and int(a.sum()) != len(a):
+        return False
+    if B is not None and float((a - 1.0).abs().sum()) > B:
         return False
     return True
 
 
-def random_feasible_action(m, rng, balance=True, k_max=None):
-    """Draw a uniform-ish feasible action (used for exploration / the random agent)."""
-    a = torch.ones(m)
-    max_r = m // 2
-    if k_max is not None:
-        max_r = min(max_r, k_max)
-    if max_r == 0:
+def random_feasible_action(m, rng, balance=True, B=None, L=2):
+    """Random feasible action via the Algorithm-2 allocation with random ties."""
+    if not balance:
+        a = torch.ones(m)
+        budget = m if B is None else B
+        order = torch.randperm(m, generator=rng)
+        for i in order:
+            if budget <= 0:
+                break
+            lvl = int(torch.randint(0, L + 1, (1,), generator=rng))
+            if abs(lvl - 1) <= budget:
+                a[i] = float(lvl)
+                budget -= abs(lvl - 1)
         return a
-    r = int(torch.randint(0, max_r + 1, (1,), generator=rng))
-    if r == 0:
-        return a
-    perm = torch.randperm(m, generator=rng)
-    a[perm[:r]] = 0.0        # delete r indices
-    a[perm[r:2 * r]] = 2.0   # duplicate r other indices
+
+    k = m if B is None else B // 2       # ||a-1||_1 = 2D under sum a = m
+    a = torch.zeros(m)
+    D = 0
+    for _ in range(m):
+        elig = (a < L) & ((a == 0) | (D < k))
+        idx = torch.where(elig)[0]
+        i = int(idx[torch.randint(0, len(idx), (1,), generator=rng)])
+        if a[i] >= 1:
+            D += 1
+        a[i] += 1
     return a

@@ -1,43 +1,25 @@
 """BDQ baseline: Branching Dueling Q-Network for batch-curation poisoning.
 
-A model-free comparison point for our FVI + per-point decomposition method.
+Model-free comparison point for our FVI + decomposition method.  PyTorch port of
+Tavakoli et al., "Action Branching Architectures for Deep RL" (AAAI 2018) --
+github.com/atavakol/action-branching-agents (MIT, (c) 2018 Arash Tavakoli) -- at the
+paper's best settings: dueling with reduceLocalMean, one shared target averaged over
+branches, per-branch TD loss averaged over branches, double-Q.
 
-Algorithm ported from Tavakoli et al., "Action Branching Architectures for Deep
-Reinforcement Learning" (AAAI 2018) -- github.com/atavakol/action-branching-agents
-(MIT License, Copyright (c) 2018 Arash Tavakoli).  That reference implementation is
-TensorFlow-1 / OpenAI-baselines; this is a faithful PyTorch re-implementation of the
-same algorithm, using the paper's best-performing settings:
+Branching is what makes 3^m (59049 at m=10) tractable: m branches of 3 sub-actions,
+linear in m rather than exponential.
 
-  - dueling with `aggregator='reduceLocalMean'`  : Q_i(a) = V(s) + A_i(a) - mean_a A_i(a)
-  - `target_version='mean'`                      : one shared target, averaged over branches
-  - `losses_version=2`                           : mean over branches of the per-branch TD loss
-  - double-Q                                     : argmin from the online net, value from target
+Four adaptations forced by our setting (comparison caveats in the README):
 
-Why BDQ fits this problem: the joint action a in {0,1,2}^m has 3^m combinations
-(59049 at m=10), which plain DQN cannot enumerate.  Action branching factors it into
-m independent branches of 3 sub-actions each -- linear instead of exponential in m.
-
-Four adaptations are forced by our setting (see README for the comparison caveats):
-
- 1. COST, NOT REWARD.  We minimise, so every `max`/`argmax` in the reference becomes
-    `min`/`argmin`.  gamma = 1 (finite horizon T, undiscounted), terminal Q = 0 at t = T.
-
- 2. THE BATCH IS PART OF THE STATE.  s_t = (theta_t, z_t), and branch i must know its
-    own point.  We use a permutation-equivariant encoder: a shared state torso over
-    (theta, theta - theta_target, t), a shared per-point encoder over (phi_i, resid_i),
-    and weight-shared branch heads.  Sharing branch weights is what makes the net
-    independent of m (the reference uses one head per action dimension, which is fine
-    for a fixed robot morphology but not for exchangeable data points).
-
- 3. FEASIBILITY.  Branches choose independently, so the joint action generally violates
-    the balance constraint (#deletes == #duplicates).  We project onto the feasible set
-    using the SAME greedy-swap rule as `selection._select_sort`, but ranking by learned
-    Q-margins instead of alpha -- so the constraint handling is identical across methods
-    and the only thing being compared is how the action is *scored*.
-
- 4. c_edit IS LEARNED, NOT GIVEN.  It reaches BDQ only through the observed cost, whereas
-    our method gets it analytically in the objective.  That asymmetry is the point of the
-    comparison: BDQ has to discover the edit/benefit trade-off from data.
+ 1. COST, NOT REWARD.  max/argmax -> min/argmin; gamma = 1; terminal Q = 0 at t = T.
+ 2. THE BATCH IS IN THE STATE.  s_t = (theta_t, z_t), so branch i must see its own point:
+    shared state torso + shared per-point encoder over (phi_i, resid_i) + weight-shared
+    branch heads, which also makes the net independent of m.
+ 3. FEASIBILITY.  Independent branches break sum a_i = m, so we project with the SAME
+    Algorithm-2 allocation as selection, ranked by Q-margins instead of alpha --
+    only the scoring differs between methods, not the constraint handling.
+ 4. c_edit IS LEARNED.  BDQ sees it only through observed cost; our method has it
+    analytically.  That asymmetry is the point of the comparison.
 """
 import copy
 
@@ -58,21 +40,19 @@ def _mlp(sizes):
 
 
 class BranchQNet(nn.Module):
-    """Q_i(s, a_i) for every point i and sub-action a_i in {delete, keep, duplicate}.
+    """Q_i(s, a_i) for every point i and sub-action a_i in {0, ..., L}.
 
-    Returns (batch, m, 3).  Dueling with local-mean aggregation: the shared state value
+    Returns (batch, m, L+1).  Dueling with local-mean aggregation: the shared state value
     V(s) carries the level, each branch's centred advantage carries the choice.
     """
 
-    N_SUB = 3                                    # a_i in {0, 1, 2}
-
-    def __init__(self, d, T, hidden=(128, 128)):
+    def __init__(self, d, T, hidden=(128, 128), L=2):
         super().__init__()
-        self.d, self.T = d, T
+        self.d, self.T, self.n_sub = d, T, L + 1
         h = hidden[-1]
         self.torso = _mlp([2 * d + T, *hidden])          # theta, error, t one-hot
         self.point_enc = _mlp([d + 1, *hidden])          # phi_i, resid_i
-        self.adv_head = _mlp([2 * h, *hidden, self.N_SUB])   # per-branch advantages
+        self.adv_head = _mlp([2 * h, *hidden, self.n_sub])   # per-branch advantages
         self.value_head = _mlp([2 * h, *hidden, 1])          # shared state value
 
     def forward(self, theta, err, t, phi, resid):
@@ -108,52 +88,44 @@ def _q_values(net, env, theta, z, t):
 
 
 # --------------------------------------------------------------------------- #
-# Feasibility projection (mirrors selection._select_sort, on Q-margins)
+# Feasibility projection (mirrors selection._select_greedy, on Q-margins)
 # --------------------------------------------------------------------------- #
-def project_action(q, balance=True, k_max=None):
-    """Greedy feasible action from per-branch Q-values q (m, 3), minimising cost.
+def project_action(q, balance=True, B=None, L=2):
+    """Feasible action from per-branch Q-values q (m, L+1), minimising cost.
 
-    Unbalanced: each branch picks its own argmin (pure BDQ), then the delete budget is
-    enforced by keeping the most valuable deletes.
-
-    Balanced: edits come in delete/duplicate swaps.  gain_del_i / gain_dup_i are the cost
-    reductions from editing point i; ranking by (gain_del - gain_dup) puts delete
-    candidates at one end and duplicate candidates at the other, so taking the top-r and
-    bottom-r gives r disjoint swaps.  We scan r and keep the best -- the same greedy-swap
-    structure as `_select_sort`, so both methods face the identical constraint.
+    Same Algorithm-2 allocation as `_select_greedy`, with the marginal cost of raising
+    point i from level s taken as Q_i(s+1) - Q_i(s) instead of alpha_i +/- rho, so both
+    methods face the identical constraint and differ only in scoring.
     """
     m = q.shape[0]
     q = q.detach()
-    gain_del = q[:, 1] - q[:, 0]                 # >0 : deleting i lowers cost
-    gain_dup = q[:, 1] - q[:, 2]                 # >0 : duplicating i lowers cost
 
     if not balance:
-        a = q.argmin(dim=1).float()
-        if k_max is not None:
-            del_idx = torch.where(a == 0.0)[0]
-            if len(del_idx) > k_max:
-                keep = del_idx[torch.argsort(gain_del[del_idx], descending=True)[:k_max]]
-                a[del_idx] = 1.0
-                a[keep] = 0.0
-        return a
+        a = q.argmin(dim=1)
+        if B is not None:
+            cost = (a.float() - 1.0).abs()
+            gain = q[:, 1] - q.gather(1, a[:, None]).squeeze(1)
+            spent, keep = 0.0, torch.ones(m)
+            for i in torch.argsort(gain, descending=True):
+                if spent + float(cost[i]) <= B:
+                    keep[i] = a[i].float()
+                    spent += float(cost[i])
+            return keep
+        return a.float()
 
-    max_r = m // 2
-    if k_max is not None:
-        max_r = min(max_r, k_max)
-    a = torch.ones(m)
-    if max_r == 0:
-        return a
-
-    order = torch.argsort(gain_del - gain_dup, descending=True)   # deletes first
-    best_r, best_gain, running = 0, 0.0, 0.0
-    for r in range(1, max_r + 1):
-        running += float(gain_del[order[r - 1]] + gain_dup[order[m - r]])
-        if running > best_gain:                  # scan (not stop): gains aren't monotone
-            best_gain, best_r = running, r
-    for r in range(best_r):
-        a[order[r]] = 0.0                        # delete
-        a[order[m - 1 - r]] = 2.0                # duplicate
-    return a
+    k = m if B is None else B // 2
+    a = torch.zeros(m, dtype=torch.long)
+    D = 0
+    for _ in range(m):                            # m allocations => sum_i a_i = m
+        nxt = (a + 1).clamp(max=L)
+        marg = q.gather(1, nxt[:, None]).squeeze(1) - q.gather(1, a[:, None]).squeeze(1)
+        elig = (a < L) & ((a == 0) | (D < k))
+        marg = marg.masked_fill(~elig, float("inf"))
+        i = int(torch.argmin(marg))
+        if a[i] >= 1:
+            D += 1
+        a[i] += 1
+    return a.float()
 
 
 class BDQAgent:
@@ -166,9 +138,9 @@ class BDQAgent:
     def act(self, theta, z, t, epsilon=0.0):
         m = z[0].shape[0]
         if epsilon > 0 and float(torch.rand(1, generator=self.rng)) < epsilon:
-            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.k_max)
+            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B, self.cfg.L)
         q = _q_values(self.net, self.env, theta, z, t)
-        return project_action(q, self.cfg.balance, self.cfg.k_max)
+        return project_action(q, self.cfg.balance, self.cfg.B, self.cfg.L)
 
 
 class BDQBuffer:
@@ -215,7 +187,7 @@ def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
     from fvi import eps_schedule, evaluate
 
     rng = torch.Generator().manual_seed(seed)
-    net = BranchQNet(env.d, env.T, cfg.hidden)
+    net = BranchQNet(env.d, env.T, cfg.hidden, cfg.L)
     agent = BDQAgent(net, env, cfg, rng)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     buffer = BDQBuffer(cfg.buffer_capacity)

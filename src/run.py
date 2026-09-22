@@ -1,9 +1,8 @@
 """End-to-end experiment: train the FVI value function, compare the method against
 the baselines, and produce the three diagnostic figures.
 
-    python run.py                 # sort selection (default)
+    python run.py                 # greedy (Algorithm 2) selection (default)
     python run.py --mode exact    # exact BQP selection (brute force here; no gurobi)
-    python run.py --mode lowrank --rank 2
 
 This reconstructs a minimal Brief I environment (linear-regression victim) and
 runs the Brief II method on top of it.
@@ -21,8 +20,7 @@ from fvi import evaluate, train_fvi
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", default="sort", choices=["sort", "lowrank", "exact"])
-    p.add_argument("--rank", type=int, default=2)
+    p.add_argument("--mode", default="greedy", choices=["greedy", "exact"])
     p.add_argument("--no-hessian", action="store_true", help="Gram-only ablation")
     p.add_argument("--K", type=int, default=None, help="override K_iters")
     p.add_argument("--seed", type=int, default=0)
@@ -31,7 +29,7 @@ def main():
 
     torch.manual_seed(args.seed)
     env_cfg = EnvConfig()
-    cfg = MethodConfig(select_mode=args.mode, rank_r=args.rank,
+    cfg = MethodConfig(select_mode=args.mode,
                        use_hessian_in_B=not args.no_hessian)
     if args.K is not None:
         cfg.K_iters = args.K
@@ -46,7 +44,7 @@ def main():
     rng = torch.Generator().manual_seed(args.seed + 100)
     baselines = {
         "null": NullAgent(),
-        "random": RandomAgent(rng, cfg.balance, cfg.k_max),
+        "random": RandomAgent(rng, cfg.balance, cfg.B, cfg.L),
         "greedy": GreedyAgent(env.victim, env.theta_target, cfg),
         tier_name(cfg.select_mode): MethodAgent(V_psi, env.victim, env.theta_target,
                                                 cfg, rng),

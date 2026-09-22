@@ -8,7 +8,7 @@ Baselines (reconstructed Brief I):
 The method (Brief II):
   - MethodAgent    : scores_and_interaction (with the learned V_hat) + select_action.
 
-Every agent exposes  act(theta, z, t, epsilon=0.0) -> a in {0,1,2}^m.
+Every agent exposes  act(theta, z, t, epsilon=0.0) -> a in {0,...,L}^m.
 """
 import torch
 
@@ -23,28 +23,27 @@ class NullAgent:
 
 
 class RandomAgent:
-    def __init__(self, rng, balance=True, k_max=None):
-        self.rng, self.balance, self.k_max = rng, balance, k_max
+    def __init__(self, rng, balance=True, B=None, L=2):
+        self.rng, self.balance, self.B, self.L = rng, balance, B, L
 
     def act(self, theta, z, t, epsilon=0.0):
-        return random_feasible_action(z[0].shape[0], self.rng, self.balance, self.k_max)
+        return random_feasible_action(z[0].shape[0], self.rng, self.balance, self.B, self.L)
 
 
 class GreedyAgent:
     """Myopic optimum of the immediate cost g (equivalently the decomposition with
-    V_hat == 0: alpha_i = lam<e,phi_i>, B = lam Phi Phi^T)."""
+    V_hat == 0: alpha_i = lam<e,phi_i>, Gamma = lam Phi Phi^T)."""
 
-    def __init__(self, victim, theta_target, cfg, mode="sort"):
+    def __init__(self, victim, theta_target, cfg, mode="greedy"):
         self.victim, self.theta_target, self.cfg, self.mode = victim, theta_target, cfg, mode
 
     def act(self, theta, z, t, epsilon=0.0):
         Phi = self.victim.phi_batch(theta, z)
         alpha = self.cfg.lam * (Phi @ (theta - self.theta_target))
-        B = self.cfg.lam * (Phi @ Phi.T)
-        return select_action(alpha, B, self.mode, k_max=self.cfg.k_max,
+        Gamma = self.cfg.lam * (Phi @ Phi.T)
+        return select_action(alpha, Gamma, self.mode, B=self.cfg.B,
                              c_edit=self.cfg.c_edit, balance=self.cfg.balance,
-                             r=self.cfg.rank_r, dual_iters=self.cfg.dual_iters,
-                             solver=self.cfg.solver)
+                             L=self.cfg.L, solver=self.cfg.solver)
 
 
 class MethodAgent:
@@ -57,13 +56,13 @@ class MethodAgent:
     def act(self, theta, z, t, epsilon=0.0):
         m = z[0].shape[0]
         if epsilon > 0 and float(torch.rand(1, generator=self.rng)) < epsilon:
-            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.k_max)
+            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B,
+                                          self.cfg.L)
 
-        need_B = self.cfg.select_mode != "sort"
-        alpha, B = scores_and_interaction(
+        need_Gamma = self.cfg.select_mode != "greedy"
+        alpha, Gamma = scores_and_interaction(
             self.V_psi, theta, z, t, self.victim, self.theta_target, self.cfg.lam,
-            need_B=need_B, use_hessian=self.cfg.use_hessian_in_B)
-        return select_action(alpha, B, self.cfg.select_mode, k_max=self.cfg.k_max,
+            need_Gamma=need_Gamma, use_hessian=self.cfg.use_hessian_in_B)
+        return select_action(alpha, Gamma, self.cfg.select_mode, B=self.cfg.B,
                              c_edit=self.cfg.c_edit, balance=self.cfg.balance,
-                             r=self.cfg.rank_r, dual_iters=self.cfg.dual_iters,
-                             solver=self.cfg.solver)
+                             L=self.cfg.L, solver=self.cfg.solver)
