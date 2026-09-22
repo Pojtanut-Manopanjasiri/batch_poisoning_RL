@@ -1,0 +1,14 @@
+name: batch-poisoning-rl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - pytorch
+  - jupyterlab
+  - ipykernel
+  - pip
+  - pip:
+      - gurobipy  # optional: enables the `exact` selection tier; brute-force fallback otherwise
+      - multiprocess  # dill-based multiprocessing: lets sweep(parallel=True) pickle notebook-local lambdas/classes

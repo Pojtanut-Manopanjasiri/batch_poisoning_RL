@@ -8,6 +8,15 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
+# run.py output (checkpoints, --diagnostics figures)
+output/
+
+# run_seeds.sh / sweep.sh per-run logs
+results/
+
+# conda installer
+Miniforge3.sh
+
 # Gurobi
 *.lic
 gurobi.log

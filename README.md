@@ -18,6 +18,11 @@ rests on. Swapping in a different victim only requires a new `phi_batch`.
 
 ## Files
 
+All Python modules live under `src/`; run scripts and notebooks stay at the repo
+root and reach them by relative path (`python src/run.py`, `sys.path.insert(0,
+"src")` in each notebook's first cell) so `output/`/`results/` still land at the
+repo root regardless of where a run is launched from.
+
 | file | contents |
 |------|----------|
 | `src/config.py`        | `EnvConfig`, `MethodConfig` (Brief II §6) |
@@ -26,14 +31,23 @@ rests on. Swapping in a different victim only requires a new `phi_batch`.
 | `src/decomposition.py` | `scores_and_interaction` — alpha, B via autodiff (§3–4.2) |
 | `src/selection.py`     | `select_action` — `greedy` (Alg. 2) / `exact` (§4.3) |
 | `src/agents.py`        | baselines (null/random/greedy) + `MethodAgent` |
-| `src/fvi.py`           | fitted value iteration loop + rollout/evaluate (§4.1) |
+| `src/fvi.py`           | `train_fvi` (bootstrapped FVI) and `train_fevi` (Alg. 1, backward induction) + rollout/evaluate (§4.1) |
 | `src/bdq.py`           | **BDQ baseline** — branching dueling Q-network (external comparison) |
+| `src/trpo.py`          | **TRPO baseline** — Plackett–Luce swap policy, hard KL trust region (external comparison) |
 | `src/diagnostics.py`   | `interaction_diagnostics` + the three figures (§5) |
 | `src/viz.py`           | plots: training curve, cost-vs-budget, cost-vs-dimension (overall and by tier), duality gap, weight-decay sweep, per-policy action map, (d=1) regression-line attack, and (d>1) parameter-space attack |
 | `src/run.py`           | end-to-end: train, compare to baselines, make figures |
 | `notebooks/experiment.ipynb` | notebook: trains, compares baselines, all diagnostics, and the d=1 regression-line demo |
 
+> `run_seeds.sh`, `sweep.sh`, `sensitivity/*.sh`, and `src/aggregate.py` are terminal
+> entry points for many-seed / task×mode×seed sweeps, written against an earlier
+> `run.py` (`--mode lowrank --rank`, `--k-max`, `--dual-iters`, per-run `results.json`,
+> `--bdq`/`--trpo`/`--device` flags). `run.py` no longer has that interface (low-rank
+> selection and PPO were dropped, FEVI added), so these scripts need adapting before use.
+
 ## Run
+
+From the terminal (writes `output/<task>_<mode>_seed<seed>_<timestamp>/results.json`):
 
 ```bash
 python src/run.py                   # greedy (Alg. 2) selection (default)
@@ -41,8 +55,9 @@ python src/run.py --mode exact      # BQP; brute force here (no Gurobi installed
 python src/run.py --no-hessian      # Gram-only ablation for B
 ```
 
-Outputs mean episode cost for null/random/greedy/method and writes
-`fig1_spectrum.png`, `fig2_rel_interaction.png`, `fig3_tiers.png`.
+Outputs mean episode cost for null/random/greedy/method (+ BDQ/TRPO with `--bdq`/`--trpo`).
+`run_seeds.sh -h` / `sweep.sh` header comments document every flag, including the
+sensitivity-analysis overrides (`--m`, `--T`, `--eta`, `--c-edit`, ...).
 
 ## What to look for
 
@@ -69,8 +84,9 @@ Ported faithfully from the reference's best settings: local-mean dueling aggrega
 `target_version='mean'`, `losses_version=2`, double-Q. Four adaptations are forced by
 our problem (documented in the `bdq.py` docstring): cost- rather than reward-convention,
 per-point conditioning via a permutation-equivariant encoder (weight-shared branches, so
-the net is independent of `m`), feasibility projection reusing the *same* greedy-swap
-rule as `selection._select_sort`, and `c_edit` reaching BDQ only through observed cost.
+the net is independent of `m`), feasibility projection reusing the *same* Algorithm-2
+allocation as `selection._select_greedy`, and `c_edit` reaching BDQ only through observed
+cost.
 
 Result at `d=5, m=10, T=10, c_edit=0.1` (mean episode cost, 200 eval episodes):
 
@@ -80,7 +96,7 @@ Result at `d=5, m=10, T=10, c_edit=0.1` (mean episode cost, 200 eval episodes):
 | greedy | 16.00 | 0.31 | — |
 | BDQ    | 11.42 | 1.11 | K=20 (same as method) |
 | BDQ    |  9.89 | —    | K=50 (2.5× budget) |
-| **method (FVI + sort)** | **8.55** | 4.06 | K=20 |
+| **method (FVI + greedy)** | **8.55** | 4.06 | K=20 |
 
 BDQ clearly beats the myopic greedy baseline — it does learn multi-step credit. But it
 stays ~14% behind our method even at 2.5× the training budget, and it under-edits (1.1
