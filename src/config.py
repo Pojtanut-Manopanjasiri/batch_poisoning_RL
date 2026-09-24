@@ -1,20 +1,9 @@
-"""Configuration for the batch-curation poisoning experiment.
-
-Two dataclasses:
-  - EnvConfig     : the environment / victim (reconstructed from Brief I).
-  - MethodConfig  : the FVI + decomposition + selection method (Brief II, sec. 6).
-"""
 from dataclasses import dataclass
 
 
 @dataclass
 class EnvConfig:
-    """Environment and victim setup.
-
-    The problem recap in Brief II fully pins down the environment except for the
-    victim's per-point loss.  We use least-squares linear regression, the minimal
-    choice that keeps the transition action-linear (no clipping / normalisation).
-    """
+    """Environment and victim setup."""
     d: int = 5          # parameter dimension  (theta in R^d)
     m: int = 8          # batch size           (points per step)
     T: int = 6          # finite horizon
@@ -27,6 +16,8 @@ class EnvConfig:
     init_scale: float = 0.3    # mlp task: std of the victim's initial weights
     target_scale: float = 1.0  # mlp task: std of the target weights; > init_scale so
                                # f(.;theta_target) is visibly non-linear
+    device: str = "cpu"        # "cpu" | "cuda"; RNG stays on CPU, so a seed gives the
+                               # same data stream on either device
 
 
 @dataclass

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run every sensitivity axis in this folder, one after another. This is the slow,
 # comprehensive path -- each axis is its own script (c_edit.sh, eta.sh, m.sh, T.sh,
-# d.sh, rank.sh, k_max.sh) and can be run standalone instead; see their headers for
+# d.sh) and can be run standalone instead; see their headers for
 # axis-specific options (VALUES, SCALE_CEDIT, BASE_C_EDIT, ...). Activate the project's
 # conda env first (conda activate batch-poisoning-rl).
 #
@@ -10,8 +10,7 @@
 #   ./sensitivity/run_all.sh --seeds 5 --jobs 8      # each axis's seeds train concurrently
 #   TASK=logistic SEEDS=1 ./sensitivity/run_all.sh   # env vars work too
 #   AXES="c_edit m T" ./sensitivity/run_all.sh       # only run these axes
-#   AXES="c_edit eta m T d rank k_max" ./sensitivity/run_all.sh   # add rank back in
-#   EXTRA_ARGS="--device mps" ./sensitivity/run_all.sh
+#   EXTRA_ARGS="--device cuda" ./sensitivity/run_all.sh
 #
 # --seeds > 1 makes every axis train that value's seeds concurrently (each script's own
 # run_seeds.sh --parallel, default 4 jobs, override with --jobs); --seeds 1 stays
@@ -20,7 +19,7 @@
 cd "$(dirname "${BASH_SOURCE[0]}")"
 set -uo pipefail   # no -e: one axis failing shouldn't cancel the rest
 
-AXES=${AXES:-"c_edit eta m T d k_max"}   # rank excluded by default -- see rank.sh's header
+AXES=${AXES:-"c_edit eta m T d"}
 seeds=""   # plain strings, not arrays: bash 3.2's `set -u` treats a never-populated
 jobs=""    # array as unbound, so this project sticks to strings for optional argv
 

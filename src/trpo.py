@@ -80,6 +80,9 @@ def _draw(scores, avail, rng):
 
 def sample_swaps(r_logits, del_s, dup_s, max_r, rng):
     """Plackett-Luce draw. Returns (a, logp, r, del_idx, dup_idx) with a feasible."""
+    # drawn on CPU: the generator is a CPU one, so a seed samples the same swaps anywhere
+    device = del_s.device
+    r_logits, del_s, dup_s = r_logits.cpu(), del_s.cpu(), dup_s.cpu()
     m = del_s.shape[0]
     lp_r = torch.log_softmax(r_logits, dim=-1)
     r = int(torch.multinomial(lp_r.exp(), 1, generator=rng))
@@ -99,7 +102,7 @@ def sample_swaps(r_logits, del_s, dup_s, max_r, rng):
         a[i] = 0.0
     for i in dup_idx:
         a[i] = 2.0
-    return a, logp, r, del_idx, dup_idx
+    return a.to(device), logp, r, del_idx, dup_idx
 
 
 def logp_swaps(r_logits, del_s, dup_s, r, del_idx, dup_idx, max_r):
@@ -127,11 +130,13 @@ def logp_swaps(r_logits, del_s, dup_s, r, del_idx, dup_idx, max_r):
 
 def greedy_swaps(r_logits, del_s, dup_s):
     """Deterministic read used at evaluation: take the modal r, then its top-r scores."""
+    device = del_s.device
+    r_logits, del_s, dup_s = r_logits.cpu(), del_s.cpu(), dup_s.cpu()
     m = del_s.shape[0]
     r = int(r_logits.argmax())
     a = torch.ones(m)
     if r == 0:
-        return a
+        return a.to(device)
     order_del = torch.argsort(del_s, descending=True)
     dels = order_del[:r]
     mask = torch.ones(m, dtype=torch.bool)
@@ -140,7 +145,7 @@ def greedy_swaps(r_logits, del_s, dup_s):
     dups = cand[torch.argsort(dup_s[cand], descending=True)[:r]]
     a[dels] = 0.0
     a[dups] = 2.0
-    return a
+    return a.to(device)
 
 
 # --------------------------------------------------------------------------- #
@@ -293,9 +298,10 @@ class TRPOAgent:
     def act(self, theta, z, t, epsilon=0.0):
         m = z[0].shape[0]
         if epsilon > 0 and float(torch.rand(1, generator=self.rng)) < epsilon:
-            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B, self.cfg.L)
+            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B,
+                                          self.cfg.L, device=z[0].device)
         err, phi, resid = _features(self.env, theta, z)
-        rl, ds, us = self.policy(theta[None], err[None], torch.tensor([t]),
+        rl, ds, us = self.policy(theta[None], err[None], torch.tensor([t], device=theta.device),
                                  phi[None], resid[None])
         if self.deterministic:
             return greedy_swaps(rl[0], ds[0], us[0])
@@ -308,7 +314,7 @@ def _rollout_trpo(env, policy, critic, cfg, rng, max_r):
     for t in range(env.T):
         z = env.stream.sample_batch(env.m, rng)
         err, phi, resid = _features(env, theta, z)
-        tt = torch.tensor([t])
+        tt = torch.tensor([t], device=theta.device)
         with torch.no_grad():
             rl, ds, us = policy(theta[None], err[None], tt, phi[None], resid[None])
             v = critic(theta[None], err[None], tt, phi[None], resid[None])
@@ -337,8 +343,8 @@ def train_trpo(env, cfg, seed=0, verbose=True, return_history=False,
         warnings.warn(f"TRPO's swap policy only reaches a_i <= 2; at L={cfg.L} it is a "
                       "restricted baseline and will look artificially weak.")
     max_r = max_swaps(env.m, cfg.B)
-    policy = SwapPolicy(env.d, env.T, max_r, cfg.hidden)
-    critic = StateValue(env.d, env.T, cfg.hidden)
+    policy = SwapPolicy(env.d, env.T, max_r, cfg.hidden).to(env.device)
+    critic = StateValue(env.d, env.T, cfg.hidden).to(env.device)
     vopt = torch.optim.Adam(critic.parameters(), lr=cfg.trpo_vf_lr,
                             weight_decay=cfg.weight_decay)
     params = list(policy.parameters())
@@ -352,15 +358,16 @@ def train_trpo(env, cfg, seed=0, verbose=True, return_history=False,
 
         th_b = torch.stack([r["theta"] for r in batch])
         er_b = torch.stack([r["err"] for r in batch])
-        t_b = torch.tensor([r["t"] for r in batch])
+        dev = env.device
+        t_b = torch.tensor([r["t"] for r in batch], device=dev)
         ph_b = torch.stack([r["phi"] for r in batch])
         rs_b = torch.stack([r["resid"] for r in batch])
-        r_b = torch.tensor([r["r"] for r in batch])
-        di_b = torch.tensor([r["del"] for r in batch])
-        ui_b = torch.tensor([r["dup"] for r in batch])
-        lp_old = torch.tensor([r["logp"] for r in batch])
-        adv = torch.tensor([r["adv"] for r in batch], dtype=torch.float32)
-        ret = torch.tensor([r["ret"] for r in batch], dtype=torch.float32)
+        r_b = torch.tensor([r["r"] for r in batch], device=dev)
+        di_b = torch.tensor([r["del"] for r in batch], device=dev)
+        ui_b = torch.tensor([r["dup"] for r in batch], device=dev)
+        lp_old = torch.tensor([r["logp"] for r in batch], device=dev)
+        adv = torch.tensor([r["adv"] for r in batch], dtype=torch.float32, device=dev)
+        ret = torch.tensor([r["ret"] for r in batch], dtype=torch.float32, device=dev)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         with torch.no_grad():                      # frozen reference distribution
@@ -408,7 +415,7 @@ def train_trpo(env, cfg, seed=0, verbose=True, return_history=False,
 
         # --- fit the critic (plain regression, outside the trust region) ---
         for _ in range(cfg.trpo_vf_iters):
-            perm = torch.randperm(len(batch), generator=rng)[:cfg.trpo_minibatch]
+            perm = torch.randperm(len(batch), generator=rng)[:cfg.trpo_minibatch].to(dev)
             v = critic(th_b[perm], er_b[perm], t_b[perm], ph_b[perm], rs_b[perm])
             vloss = ((v - ret[perm]) ** 2).mean()
             vopt.zero_grad()

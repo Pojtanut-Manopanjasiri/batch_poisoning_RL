@@ -1,25 +1,13 @@
-"""Agents.
-
-Baselines (reconstructed Brief I):
-  - NullAgent      : keep everything (a = 1). No edits, no attack.
-  - RandomAgent    : a uniform-ish feasible action.
-  - GreedyAgent    : myopic -- minimise the one-step cost g only (V_hat = 0).
-
-The method (Brief II):
-  - MethodAgent    : scores_and_interaction (with the learned V_hat) + select_action.
-
-Every agent exposes  act(theta, z, t, epsilon=0.0) -> a in {0,...,L}^m.
-"""
 import torch
 
 from decomposition import scores_and_interaction
 from env import random_feasible_action
-from selection import select_action
+from selection import _feasible_set, count_feasible, select_action
 
 
 class NullAgent:
     def act(self, theta, z, t, epsilon=0.0):
-        return torch.ones(z[0].shape[0])
+        return torch.ones(z[0].shape[0], device=z[0].device)
 
 
 class RandomAgent:
@@ -27,7 +15,8 @@ class RandomAgent:
         self.rng, self.balance, self.B, self.L = rng, balance, B, L
 
     def act(self, theta, z, t, epsilon=0.0):
-        return random_feasible_action(z[0].shape[0], self.rng, self.balance, self.B, self.L)
+        return random_feasible_action(z[0].shape[0], self.rng, self.balance, self.B, self.L,
+                                      device=z[0].device)
 
 
 class GreedyAgent:
@@ -46,6 +35,63 @@ class GreedyAgent:
                              L=self.cfg.L, solver=self.cfg.solver)
 
 
+def clairvoyant_search_size(m, T, cfg):
+    """(|A| per step, worst-case search nodes per episode) for ClairvoyantAgent."""
+    n_actions = count_feasible(m, cfg.balance, cfg.B, cfg.L)
+    return n_actions, float(n_actions) ** T
+
+
+class ClairvoyantAgent:
+    """Oracle: solves the T-stage problem to exact optimality given the full batch
+    stream, via branch-and-bound DFS over the joint action sequence. Call `plan`
+    once per episode before `act`, which just replays the resulting sequence.
+    """
+
+    def __init__(self, victim, theta_target, cfg):
+        self.victim, self.theta_target, self.cfg = victim, theta_target, cfg
+        self._actions, self._i = None, 0
+
+    def _step_costs(self, theta, z, A, target):
+        Phi = self.victim.phi_batch(theta, z)                    # (m, d)
+        theta_next = theta.unsqueeze(0) + A @ Phi                # (N, d)
+        edits = torch.abs(A - 1.0).sum(dim=1)
+        nef = 0.5 * self.cfg.lam * ((theta_next - target) ** 2).sum(dim=1)
+        return self.cfg.c_edit * edits + nef, theta_next
+
+    def plan(self, theta_0, zs):
+        # searched on CPU: every node reads its costs back to order and prune children
+        cfg = self.cfg
+        device = theta_0.device
+        theta_0, target = theta_0.cpu(), self.theta_target.cpu()
+        zs = [(x.cpu(), y.cpu()) for x, y in zs]
+        m = zs[0][0].shape[0]
+        A = _feasible_set(m, cfg.balance, cfg.B, cfg.L)
+
+        best_cost, best_actions = float("inf"), None
+        actions = [None] * len(zs)
+
+        def rec(t, theta, cost_so_far):
+            nonlocal best_cost, best_actions
+            if cost_so_far >= best_cost:
+                return
+            if t == len(zs):
+                best_cost, best_actions = cost_so_far, actions.copy()
+                return
+            step_cost, theta_next = self._step_costs(theta, zs[t], A, target)
+            for i in torch.argsort(step_cost).tolist():
+                actions[t] = A[i]
+                rec(t + 1, theta_next[i].detach(), cost_so_far + float(step_cost[i]))
+
+        rec(0, theta_0, 0.0)
+        self._actions, self._i = [a.to(device) for a in best_actions], 0
+        return best_cost
+
+    def act(self, theta, z, t, epsilon=0.0):
+        a = self._actions[self._i]
+        self._i += 1
+        return a
+
+
 class MethodAgent:
     """FVI policy: build alpha, B from the learned V_hat, then select an action."""
 
@@ -57,7 +103,7 @@ class MethodAgent:
         m = z[0].shape[0]
         if epsilon > 0 and float(torch.rand(1, generator=self.rng)) < epsilon:
             return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B,
-                                          self.cfg.L)
+                                          self.cfg.L, device=z[0].device)
 
         need_Gamma = self.cfg.select_mode != "greedy"
         alpha, Gamma = scores_and_interaction(

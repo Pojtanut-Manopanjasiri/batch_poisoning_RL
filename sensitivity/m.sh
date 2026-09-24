@@ -23,7 +23,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 set -uo pipefail
 
 TASK=${TASK:-linear}
-MODE=${MODE:-sort}
+MODE=${MODE:-greedy}
 SEEDS=${SEEDS:-1}
 JOBS=${JOBS:-4}
 VALUES=${VALUES:-"4 6 8 10 14"}

@@ -93,6 +93,20 @@ def _feasible_set(m, balance, B, L):
     return _FEASIBLE_CACHE[key]
 
 
+def count_feasible(m, balance, B, L):
+    """|A| without enumerating (L+1)^m: DP over points, tracking (sum, edits)."""
+    states = {(0, 0): 1}
+    for _ in range(m):
+        nxt = {}
+        for (s, e), c in states.items():
+            for v in range(L + 1):
+                e2 = e + abs(v - 1)
+                if B is None or e2 <= B:
+                    nxt[(s + v, e2)] = nxt.get((s + v, e2), 0) + c
+        states = nxt
+    return sum(c for (s, _), c in states.items() if not balance or s == m)
+
+
 def _select_bruteforce(alpha, Gamma, c_edit, B, balance, m, L):
     A = _feasible_set(m, balance, B, L)
     edits = torch.abs(A - 1.0).sum(1)
@@ -165,9 +179,16 @@ def _select_exact(alpha, Gamma, c_edit, B, balance, m, L, solver):
 def select_action(alpha, Gamma, mode, B=None, c_edit=0.0, balance=True, L=2,
                   solver="gurobi"):
     """mode in {"greedy","exact"}; returns a in {0,...,L}^m, feasible."""
+    # solved on CPU: the allocation is a sequential loop, and on GPU every step would
+    # block on an argmin readback
+    device = alpha.device
+    alpha = alpha.cpu()
+    Gamma = None if Gamma is None else Gamma.cpu()
     m = alpha.shape[0]
     if mode == "greedy":
-        return _select_greedy(alpha, c_edit, B, balance, m, L)
-    if mode == "exact":
-        return _select_exact(alpha, Gamma, c_edit, B, balance, m, L, solver)
-    raise ValueError(f"unknown mode {mode!r}")
+        a = _select_greedy(alpha, c_edit, B, balance, m, L)
+    elif mode == "exact":
+        a = _select_exact(alpha, Gamma, c_edit, B, balance, m, L, solver)
+    else:
+        raise ValueError(f"unknown mode {mode!r}")
+    return a.to(device)

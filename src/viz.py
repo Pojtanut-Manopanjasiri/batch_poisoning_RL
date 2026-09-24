@@ -398,8 +398,8 @@ def _simulate_with_actions(env, agent, batches):
         xs.append(z[0].reshape(-1)); ys.append(z[1].reshape(-1)); acts.append(a)
         theta = env.victim.update(theta, z, a).detach()
         thetas.append(float(theta))
-    return (thetas, torch.cat(xs).numpy(), torch.cat(ys).numpy(),
-            torch.cat(acts).numpy())
+    return (thetas, torch.cat(xs).cpu().numpy(), torch.cat(ys).cpu().numpy(),
+            torch.cat(acts).cpu().numpy())
 
 
 def _simulate_vec(env, agent, batches):
@@ -447,10 +447,10 @@ def plot_attack_paramspace(env, attack_agent, path, rng, clean_agent=None):
     axL.legend(fontsize=9)
 
     idx, w = np.arange(env.d), 0.2
-    axR.bar(idx - 1.5 * w, star.numpy(), w, label="θ* (true)", color="g")
-    axR.bar(idx - 0.5 * w, target.numpy(), w, label="θ̃ (target)", color="r")
-    axR.bar(idx + 0.5 * w, theta_clean[-1].numpy(), w, label="clean final", color="b")
-    axR.bar(idx + 1.5 * w, theta_atk[-1].numpy(), w, label="attacked final", color="m")
+    axR.bar(idx - 1.5 * w, star.cpu().numpy(), w, label="θ* (true)", color="g")
+    axR.bar(idx - 0.5 * w, target.cpu().numpy(), w, label="θ̃ (target)", color="r")
+    axR.bar(idx + 0.5 * w, theta_clean[-1].cpu().numpy(), w, label="clean final", color="b")
+    axR.bar(idx + 1.5 * w, theta_atk[-1].cpu().numpy(), w, label="attacked final", color="m")
     axR.axhline(0, color="k", lw=0.6)
     axR.set_xlabel("coefficient index i"); axR.set_ylabel("θ_i")
     axR.set_title("Final regression coefficients")
@@ -474,7 +474,7 @@ def plot_regression_attack_grid(env, agents, path, rng, ncols=2):
 
     batches = _episode_batches(env, rng)
     star, target = float(env.stream.theta_star), float(env.theta_target)
-    all_x = torch.cat([z[0].reshape(-1) for z in batches]).numpy()
+    all_x = torch.cat([z[0].reshape(-1) for z in batches]).cpu().numpy()
     xline = np.linspace(all_x.min(), all_x.max(), 100)
 
     n = len(agents)
@@ -529,8 +529,8 @@ def plot_regression_attack(env, attack_agent, path, rng, clean_agent=None):
     theta_clean = _simulate(env, clean_agent, batches)
     theta_atk = _simulate(env, attack_agent, batches)
 
-    xs = torch.cat([z[0].reshape(-1) for z in batches]).numpy()
-    ys = torch.cat([z[1].reshape(-1) for z in batches]).numpy()
+    xs = torch.cat([z[0].reshape(-1) for z in batches]).cpu().numpy()
+    ys = torch.cat([z[1].reshape(-1) for z in batches]).cpu().numpy()
     xline = np.linspace(xs.min(), xs.max(), 100)
     star, target = float(env.stream.theta_star), float(env.theta_target)
 

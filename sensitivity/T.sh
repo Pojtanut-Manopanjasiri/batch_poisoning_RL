@@ -21,7 +21,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 set -uo pipefail
 
 TASK=${TASK:-linear}
-MODE=${MODE:-sort}
+MODE=${MODE:-greedy}
 SEEDS=${SEEDS:-1}
 JOBS=${JOBS:-4}
 VALUES=${VALUES:-"1 2 4 6 10 14"}

@@ -18,7 +18,7 @@
 #
 # Each value gets its own ./run_seeds.sh call (seeds trained, then folded into one
 # output/<task>_<mode>_<tag>_results_<timestamp>.json and cleaned up by aggregate.py,
-# tag = a c_edit/eta/m/T/d/rank/k_max summary) BEFORE the next value starts. Every call
+# tag = a c_edit/eta/m/T/d summary) BEFORE the next value starts. Every call
 # passes --sens-axis c_edit, recorded verbatim in each seed's results.json and carried
 # through by aggregate.py -- the notebook's sensitivity loader reads this tag directly
 # rather than inferring axis membership from config content, so it can't be confused by
@@ -34,7 +34,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 set -uo pipefail
 
 TASK=${TASK:-linear}
-MODE=${MODE:-sort}
+MODE=${MODE:-greedy}
 SEEDS=${SEEDS:-3}
 JOBS=${JOBS:-4}
 VALUES=${VALUES:-"0.0 0.025 0.05 0.1 0.2 0.4"}

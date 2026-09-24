@@ -32,8 +32,9 @@ class ReplayBuffer:
 
     def push(self, transitions):
         theta = torch.stack([tr[0] for tr in transitions])
-        t = torch.tensor([tr[1] for tr in transitions])
-        c = torch.tensor([tr[2] for tr in transitions], dtype=torch.float32)
+        t = torch.tensor([tr[1] for tr in transitions], device=theta.device)
+        c = torch.tensor([tr[2] for tr in transitions], dtype=torch.float32,
+                         device=theta.device)
         theta_next = torch.stack([tr[3] for tr in transitions])
         if self.theta is None:
             self.theta, self.t, self.c, self.theta_next = theta, t, c, theta_next
@@ -49,6 +50,7 @@ class ReplayBuffer:
 
     def sample(self, batch_size, rng):
         idx = torch.randint(0, len(self), (min(batch_size, len(self)),), generator=rng)
+        idx = idx.to(self.theta.device)
         return self.theta[idx], self.t[idx], self.c[idx], self.theta_next[idx]
 
     def __len__(self):
@@ -59,27 +61,40 @@ def eps_schedule(k, K, e0, e1):
     return e0 + (e1 - e0) * (k / max(1, K - 1))
 
 
-def rollout(env, agent, rng, epsilon=0.0):
-    """One episode. Returns (transitions, total_cost).
+def rollout(env, agent, rng, epsilon=0.0, trace=False):
+    """One episode. Returns (transitions, total_cost, steps).
 
-    transition = (theta_t, t, cost_t, theta_{t+1}).
+    transition = (theta_t, t, cost_t, theta_{t+1}); steps is the per-step record of what
+    the policy did (empty unless trace, which training rollouts don't need).
     """
-    transitions, total = [], 0.0
+    transitions, total, steps = [], 0.0, []
     theta = env.theta_0.clone()
+    zs = None
+    if hasattr(agent, "plan"):
+        zs = [env.stream.sample_batch(env.m, rng) for _ in range(env.T)]
+        agent.plan(theta, zs)
     for t in range(env.T):
-        z = env.stream.sample_batch(env.m, rng)
+        z = zs[t] if zs is not None else env.stream.sample_batch(env.m, rng)
         a = agent.act(theta, z, t, epsilon=epsilon)
         theta_next = env.victim.update(theta, z, a)
         c = env.cost(theta, z, a, theta_next)
         transitions.append((theta.detach(), t, c, theta_next.detach()))
+        if trace:
+            steps.append({"t": t, "action": [int(v) for v in a.tolist()], "cost": c,
+                          "dist_to_target": float((theta_next - env.theta_target).norm())})
         total += c
         theta = theta_next.detach()
-    return transitions, total
+    return transitions, total, steps
 
 
 def evaluate(env, agent, rng, n_episodes=100):
     """Mean episode cost of a policy (the objective we minimise)."""
     return sum(rollout(env, agent, rng)[1] for _ in range(n_episodes)) / n_episodes
+
+
+def trace_episodes(env, agent, rng, n_episodes):
+    """Per-step actions and costs for n_episodes, through the same rollout path."""
+    return [rollout(env, agent, rng, trace=True)[2] for _ in range(n_episodes)]
 
 
 def train_fvi(env, cfg, seed=0, verbose=True, return_history=False,
@@ -102,7 +117,7 @@ def train_fvi(env, cfg, seed=0, verbose=True, return_history=False,
     """
     rng = torch.Generator().manual_seed(seed)
     V_psi = ValueNet(env.d, env.T, cfg.hidden,
-                     time_encoding=getattr(cfg, "time_encoding", "elapsed"))
+                     time_encoding=getattr(cfg, "time_encoding", "elapsed")).to(env.device)
     agent = MethodAgent(V_psi, env.victim, env.theta_target, cfg, rng)
     opt = torch.optim.Adam(V_psi.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     buffer = ReplayBuffer(cfg.buffer_capacity)
@@ -218,7 +233,7 @@ def train_fevi(env, cfg, seed=0, verbose=True, return_history=False,
     shared = getattr(cfg, "fevi_shared", False)
     enc = getattr(cfg, "time_encoding", "elapsed")
     V = (ValueNet(env.d, env.T, cfg.hidden, time_encoding=enc) if shared
-         else StagedValue(env.d, env.T, cfg.hidden, time_encoding=enc))
+         else StagedValue(env.d, env.T, cfg.hidden, time_encoding=enc)).to(env.device)
     opt_shared = (torch.optim.Adam(V.parameters(), lr=cfg.lr,
                                    weight_decay=cfg.weight_decay) if shared else None)
     agent = MethodAgent(V, env.victim, env.theta_target, cfg, rng)
@@ -242,7 +257,7 @@ def train_fevi(env, cfg, seed=0, verbose=True, return_history=False,
             idx = torch.randint(0, len(R[t]), (min(cfg.fevi_N, len(R[t])),), generator=rng)
             thetas = torch.stack([R[t][int(i)] for i in idx])          # line 3
 
-            Y = torch.empty(len(thetas))
+            Y = torch.empty(len(thetas), device=env.device)
             for n, theta in enumerate(thetas):                         # line 4
                 acc = 0.0
                 for _ in range(cfg.fevi_M):                            # line 5
@@ -257,12 +272,12 @@ def train_fevi(env, cfg, seed=0, verbose=True, return_history=False,
             if shared:
                 # pool with stages already solved, so fitting t does not overwrite them
                 pool_th.append(thetas)
-                pool_t.append(torch.full((len(thetas),), float(t)))
+                pool_t.append(torch.full((len(thetas),), float(t), device=env.device))
                 pool_y.append(Y)
                 TH, TT, YY = torch.cat(pool_th), torch.cat(pool_t), torch.cat(pool_y)
                 for _ in range(cfg.fevi_fit_steps):
                     j = torch.randint(0, len(TH), (min(cfg.batch_size, len(TH)),),
-                                      generator=rng)
+                                      generator=rng).to(env.device)
                     loss = ((V(TH[j], TT[j]) - YY[j]) ** 2).mean()
                     opt_shared.zero_grad()
                     loss.backward()
@@ -273,7 +288,7 @@ def train_fevi(env, cfg, seed=0, verbose=True, return_history=False,
                                        weight_decay=cfg.weight_decay)
                 for _ in range(cfg.fevi_fit_steps):
                     j = torch.randint(0, len(thetas), (min(cfg.batch_size, len(thetas)),),
-                                      generator=rng)
+                                      generator=rng).to(env.device)
                     loss = ((net(thetas[j], t) - Y[j]) ** 2).mean()
                     opt.zero_grad()
                     loss.backward()

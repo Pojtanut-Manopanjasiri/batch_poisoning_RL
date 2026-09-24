@@ -12,6 +12,8 @@ Cost (minimisation, ZZL convention):
     g = c_edit * sum_i |a_i - 1|            (perturbation / total-variation)
       + (lam/2) * ||theta_{t+1} - theta_target||^2   (nefarious)
 """
+import functools
+
 import torch
 
 
@@ -29,10 +31,15 @@ class Stream:
         self.d = cfg.d
         self.noise = cfg.noise
         self.task = cfg.task
+        self.device = torch.device(cfg.device)
         g = torch.Generator().manual_seed(cfg.seed)
         self.theta_star = torch.randn(cfg.d, generator=g)
 
     def sample_batch(self, m, rng):
+        x, y = self._sample_cpu(m, rng)
+        return (x.to(self.device), y.to(self.device))
+
+    def _sample_cpu(self, m, rng):
         x = torch.randn(m, self.d, generator=rng)
         if self.task == "logistic":
             p = torch.sigmoid(x @ self.theta_star)
@@ -135,6 +142,17 @@ class MLPVictim:
         return theta + a @ self.phi_batch(theta, z)
 
 
+@functools.cache
+def _use_stock_cuda_kernels():
+    # torch sends the bmm inside vmap(grad)'s backward to a Triton kernel, which compiles
+    # a C launcher on first use and fails on machines without a C compiler
+    try:
+        from torch._native.registry import deregister_op_overrides
+    except ImportError:                      # torch without the Triton override layer
+        return
+    deregister_op_overrides(disable_dsl_names="triton")
+
+
 class Environment:
     """Bundles stream + victim + attacker target and exposes cost / reset."""
 
@@ -156,6 +174,11 @@ class Environment:
             self.d = env_cfg.d
             self.theta_target = torch.randn(env_cfg.d, generator=g)
             self.theta_0 = torch.zeros(env_cfg.d)
+        self.device = torch.device(env_cfg.device)
+        if self.device.type == "cuda":
+            _use_stock_cuda_kernels()
+        self.theta_0 = self.theta_0.to(self.device)
+        self.theta_target = self.theta_target.to(self.device)
         self.m, self.T = env_cfg.m, env_cfg.T
         self.lam = method_cfg.lam
         self.c_edit = method_cfg.c_edit
@@ -180,8 +203,12 @@ def is_feasible(a, balance=True, B=None, L=2):
     return True
 
 
-def random_feasible_action(m, rng, balance=True, B=None, L=2):
+def random_feasible_action(m, rng, balance=True, B=None, L=2, device="cpu"):
     """Random feasible action via the Algorithm-2 allocation with random ties."""
+    return _random_feasible_cpu(m, rng, balance, B, L).to(device)
+
+
+def _random_feasible_cpu(m, rng, balance, B, L):
     if not balance:
         a = torch.ones(m)
         budget = m if B is None else B

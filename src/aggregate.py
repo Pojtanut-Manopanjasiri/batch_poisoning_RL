@@ -1,32 +1,3 @@
-"""Fold every currently-available seed's results.json for one (task, mode) into one or
-more combined files -- run_seeds.sh/sweep.sh call this automatically after training;
-run it by hand any time to snapshot whatever seeds exist right now.
-
-    python src/aggregate.py --task regression --mode sort
-    python src/aggregate.py --task regression --mode lowrank
-
-Matching is by ACTUAL config content (each per-seed results.json's own env_config/
-method_config), not by directory name -- run.py's own run_dir naming includes a config
-tag for human readability (see run.py's config_tag), but this script never relies on
-parsing it. That matters because sensitivity/*.sh sweeps write many seed-dirs for the
-SAME (task, mode) at DIFFERENT c_edit/eta/m/T/d/rank_r/k_max, all sitting in output/ at
-once if you run more than one sweep concurrently -- grouping by content means each
-distinct config gets its own output file even if their seed-dirs are interleaved,
-instead of one sweep's seeds silently drifting into another's summary. The grouping key
-also includes each run's "sens_axis" tag (set by sensitivity/*.sh via run.py's
---sens-axis) so two different axis scripts that happen to produce the identical config
-(e.g. every axis's own baseline point) still never fold into the same combined file.
-
-Per-seed results.json files are transient: each is folded in and then deleted, so only
-the combined snapshot(s) persist. Every distinct config found gets its own fresh
-output/<task>_<mode>_<tag>_results_<timestamp>.json (tag = the same c_edit/eta/m/T/d/
-rank_r/k_max summary run.py's run_dir uses) -- it does not update a previous one, so
-separate runs (e.g. training more seeds later) don't overwrite each other; if you want
-everything in one place, load and concatenate the snapshots you care about.
-
-    {"task":..., "mode":..., "seeds": [...], "runs": [{"seed":0, "costs": {...}}, ...],
-     "summary": {"first-order": {"mean":..., "std":...}, ...}}
-"""
 import argparse
 import glob
 import json
@@ -35,7 +6,7 @@ from datetime import datetime
 
 import numpy as np
 
-CONFIG_FIELDS = ["c_edit", "eta", "m", "T", "d", "rank_r", "k_max"]
+CONFIG_FIELDS = ["c_edit", "eta", "m", "T", "d"]
 
 
 def _fmt(x):
@@ -48,7 +19,45 @@ def _fmt(x):
 
 def config_tag(cfg):
     return (f"ce{_fmt(cfg['c_edit'])}_eta{_fmt(cfg['eta'])}_m{_fmt(cfg['m'])}"
-            f"_T{_fmt(cfg['T'])}_d{_fmt(cfg['d'])}_r{_fmt(cfg['rank_r'])}_k{_fmt(cfg['k_max'])}")
+            f"_T{_fmt(cfg['T'])}_d{_fmt(cfg['d'])}")
+
+
+def print_summary(out, cfg):
+    """Per-method cost across seeds, best first, with each seed's own value."""
+    summary, runs = out["summary"], out["runs"]
+    names = sorted(summary, key=lambda n: summary[n]["mean"])
+    null = summary.get("null", {}).get("mean")
+    seeds = out["seeds"]
+
+    print(f"\n  task={out['task']}  mode={out['mode']}  learner={out['learner']}"
+          + (f"  axis={out['sens_axis']}" if out.get("sens_axis") else ""))
+    print(f"  m={cfg['m']} T={cfg['T']} d={cfg['d']} eta={cfg['eta']} "
+          f"c_edit={cfg['c_edit']} lam={cfg['lam']} L={cfg['L']} B={cfg['B']}  "
+          f"seeds={len(seeds)}")
+
+    per_seed = len(seeds) <= 10
+    head = f"  {'method':14s}{'mean':>10s}{'std':>9s}{'vs null':>9s}"
+    if per_seed:
+        head += "   " + "".join(f"{f's{s}':>8s}" for s in seeds)
+    print("\n" + head)
+    print("  " + "-" * (len(head) - 2))
+    for n in names:
+        st = summary[n]
+        rel = f"{(null - st['mean']) / null * 100:+.1f}%" if null else "--"
+        mark = "*" if n == names[0] else " "
+        line = f"{mark} {n:14s}{st['mean']:10.4f}{st['std']:9.4f}{rel:>9s}"
+        if per_seed:
+            by_seed = {r["seed"]: r["costs"].get(n) for r in runs}
+            line += "   " + "".join(
+                f"{by_seed[s]:8.3f}" if by_seed.get(s) is not None else f"{'--':>8s}"
+                for s in seeds)
+        print(line)
+    print("  (lower is better; * = best mean; vs null = cost reduction over no attack)")
+    incomplete = [str(r["seed"]) for r in runs if r.get("complete") is False]
+    if incomplete:
+        print(f"  WARNING: seed(s) {', '.join(incomplete)} incomplete (interrupted); their "
+              "missing methods are excluded from the means")
+    print()
 
 
 def main():
@@ -69,7 +78,10 @@ def main():
         if run["mode"] != args.mode:
             continue
         cfg = {**run["env_config"], **run["method_config"]}
-        key = tuple(cfg[f] for f in CONFIG_FIELDS) + (run.get("sens_axis"),)
+        # learner is part of the key: fvi and fevi runs at the same config are
+        # different algorithms and must not be averaged into one summary
+        key = tuple(cfg[f] for f in CONFIG_FIELDS) + (run.get("sens_axis"),
+                                                      run.get("learner"))
         groups.setdefault(key, []).append((path, run))
 
     if not groups:
@@ -89,10 +101,13 @@ def main():
             for n in names
         }
 
-        out = {"task": args.task, "mode": args.mode, "sens_axis": runs[0].get("sens_axis"),
+        learner = runs[0].get("learner", "fvi")
+        out = {"task": args.task, "mode": args.mode, "learner": learner,
+               "sens_axis": runs[0].get("sens_axis"),
                "seeds": [r["seed"] for r in runs], "runs": runs, "summary": summary}
         tag = config_tag(cfg)
-        out_path = os.path.join(args.outdir, f"{args.task}_{args.mode}_{tag}_results_{timestamp}.json")
+        out_path = os.path.join(
+            args.outdir, f"{args.task}_{args.mode}_{learner}_{tag}_results_{timestamp}.json")
         with open(out_path, "w") as f:
             json.dump(out, f, indent=2)
 
@@ -107,6 +122,7 @@ def main():
                 pass   # not empty (e.g. --diagnostics figures live there too) -- leave it
 
         print(f"wrote {out_path}  ({len(runs)} seed(s): {out['seeds']})")
+        print_summary(out, cfg)
 
 
 if __name__ == "__main__":

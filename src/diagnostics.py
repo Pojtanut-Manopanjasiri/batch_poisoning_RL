@@ -30,13 +30,13 @@ from selection import _objective, select_action
 def interaction_diagnostics(alpha, Gamma, a_sort, a_exact, Phi, lam, c_edit):
     lin = float(a_sort @ alpha)                       # linear-term magnitude
     pair = float(0.5 * a_sort @ Gamma @ a_sort)           # neglected interaction
-    eig = torch.linalg.eigvalsh(0.5 * (Gamma + Gamma.T)).numpy()
+    eig = torch.linalg.eigvalsh(0.5 * (Gamma + Gamma.T)).cpu().numpy()
     eig_desc = np.sort(np.abs(eig))[::-1]
     gram = lam * (Phi @ Phi.T)
     return {
         "rel_interaction": abs(pair) / (abs(lin) + 1e-12),
         "spectrum": eig_desc,
-        "eff_rank": float(np.trace(Gamma.numpy()) / (np.abs(eig).max() + 1e-12)),
+        "eff_rank": float(np.trace(Gamma.cpu().numpy()) / (np.abs(eig).max() + 1e-12)),
         "trace_frac_top1": float(eig_desc[0] / eig_desc.sum()),
         "trace_frac_top5": float(eig_desc[:5].sum() / eig_desc.sum()),
         "gram_only_pair": float(0.5 * a_sort @ gram @ a_sort),
@@ -57,7 +57,8 @@ def _states_alpha_B(env, agent, V_psi, cfg, rng, n_episodes):
             alpha, Gamma = scores_and_interaction(
                 V_psi, theta, z, t, env.victim, env.theta_target, cfg.lam,
                 need_Gamma=True, use_hessian=cfg.use_hessian_in_B)
-            records.append((theta.clone(), t, z, alpha, Gamma, Phi))
+            records.append((theta.cpu(), t, tuple(v.cpu() for v in z),
+                            alpha.cpu(), Gamma.cpu(), Phi.cpu()))
             a = agent.act(theta, z, t)
             theta = env.victim.update(theta, z, a).detach()
     return records
@@ -100,7 +101,7 @@ def _mean_rel_interaction(env, cfg, rng, n_episodes, Gamma=None):
             Phi = env.victim.phi_batch(theta, z)
             alpha = cfg.lam * (Phi @ (theta - env.theta_target))
             Gamma = cfg.lam * (Phi @ Phi.T)
-            a = select_action(alpha, Gamma, "greedy", Gamma=Gamma, c_edit=cfg.c_edit,
+            a = select_action(alpha, Gamma, "greedy", B=cfg.B, c_edit=cfg.c_edit,
                               balance=cfg.balance, L=cfg.L)
             lin = float(a @ alpha)
             pair = float(0.5 * a @ Gamma @ a)
@@ -148,7 +149,7 @@ def figure_tier_comparison(records, path, cfg):
     for (_, _, _, alpha, Gamma, _) in records:
         for tier in tiers:
             t0 = time.perf_counter()
-            a = select_action(alpha, Gamma, tier, Gamma=cfg.B, c_edit=cfg.c_edit,
+            a = select_action(alpha, Gamma, tier, B=cfg.B, c_edit=cfg.c_edit,
                               balance=cfg.balance, L=cfg.L, solver=cfg.solver)
             times[tier].append(time.perf_counter() - t0)
             costs[tier].append(_objective(a, alpha, Gamma, cfg.c_edit))  # full-Gamma cost

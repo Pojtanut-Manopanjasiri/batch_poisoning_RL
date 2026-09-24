@@ -1,26 +1,3 @@
-"""BDQ baseline: Branching Dueling Q-Network for batch-curation poisoning.
-
-Model-free comparison point for our FVI + decomposition method.  PyTorch port of
-Tavakoli et al., "Action Branching Architectures for Deep RL" (AAAI 2018) --
-github.com/atavakol/action-branching-agents (MIT, (c) 2018 Arash Tavakoli) -- at the
-paper's best settings: dueling with reduceLocalMean, one shared target averaged over
-branches, per-branch TD loss averaged over branches, double-Q.
-
-Branching is what makes 3^m (59049 at m=10) tractable: m branches of 3 sub-actions,
-linear in m rather than exponential.
-
-Four adaptations forced by our setting (comparison caveats in the README):
-
- 1. COST, NOT REWARD.  max/argmax -> min/argmin; gamma = 1; terminal Q = 0 at t = T.
- 2. THE BATCH IS IN THE STATE.  s_t = (theta_t, z_t), so branch i must see its own point:
-    shared state torso + shared per-point encoder over (phi_i, resid_i) + weight-shared
-    branch heads, which also makes the net independent of m.
- 3. FEASIBILITY.  Independent branches break sum a_i = m, so we project with the SAME
-    Algorithm-2 allocation as selection, ranked by Q-margins instead of alpha --
-    only the scoring differs between methods, not the constraint handling.
- 4. c_edit IS LEARNED.  BDQ sees it only through observed cost; our method has it
-    analytically.  That asymmetry is the point of the comparison.
-"""
 import copy
 
 import torch
@@ -84,7 +61,8 @@ def _features(env, theta, z):
 def _q_values(net, env, theta, z, t):
     """Q for a single state -> (m, 3)."""
     err, phi, resid = _features(env, theta, z)
-    return net(theta[None], err[None], torch.tensor([t]), phi[None], resid[None])[0]
+    return net(theta[None], err[None], torch.tensor([t], device=theta.device),
+               phi[None], resid[None])[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -97,8 +75,13 @@ def project_action(q, balance=True, B=None, L=2):
     point i from level s taken as Q_i(s+1) - Q_i(s) instead of alpha_i +/- rho, so both
     methods face the identical constraint and differ only in scoring.
     """
+    # allocated on CPU: the loop below reads an argmin back on every step
+    device = q.device
+    return _project_cpu(q.detach().cpu(), balance, B, L).to(device)
+
+
+def _project_cpu(q, balance, B, L):
     m = q.shape[0]
-    q = q.detach()
 
     if not balance:
         a = q.argmin(dim=1)
@@ -138,7 +121,8 @@ class BDQAgent:
     def act(self, theta, z, t, epsilon=0.0):
         m = z[0].shape[0]
         if epsilon > 0 and float(torch.rand(1, generator=self.rng)) < epsilon:
-            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B, self.cfg.L)
+            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B,
+                                          self.cfg.L, device=z[0].device)
         q = _q_values(self.net, self.env, theta, z, t)
         return project_action(q, self.cfg.balance, self.cfg.B, self.cfg.L)
 
@@ -166,13 +150,14 @@ class BDQBuffer:
 def _stack(env, batch):
     """Collate sampled transitions into tensors for the network."""
     th = torch.stack([b[0] for b in batch])
+    dev = th.device
     z = [b[1] for b in batch]
-    t = torch.tensor([b[2] for b in batch])
+    t = torch.tensor([b[2] for b in batch], device=dev)
     a = torch.stack([b[3] for b in batch]).long()
-    c = torch.tensor([b[4] for b in batch], dtype=torch.float32)
+    c = torch.tensor([b[4] for b in batch], dtype=torch.float32, device=dev)
     th_n = torch.stack([b[5] for b in batch])
     z_n = [b[6] for b in batch]
-    done = torch.tensor([b[7] for b in batch], dtype=torch.float32)
+    done = torch.tensor([b[7] for b in batch], dtype=torch.float32, device=dev)
 
     def feat(thetas, zs):
         errs, phis, resids = zip(*[_features(env, thetas[i], zs[i]) for i in range(len(zs))])
@@ -187,7 +172,7 @@ def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
     from fvi import eps_schedule, evaluate
 
     rng = torch.Generator().manual_seed(seed)
-    net = BranchQNet(env.d, env.T, cfg.hidden, cfg.L)
+    net = BranchQNet(env.d, env.T, cfg.hidden, cfg.L).to(env.device)
     agent = BDQAgent(net, env, cfg, rng)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     buffer = BDQBuffer(cfg.buffer_capacity)
