@@ -8,11 +8,15 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
-# run.py output (checkpoints, --diagnostics figures)
+# compare.py / verify_theorem1.py output
 output/
 
-# run_seeds.sh / sweep.sh per-run logs
+# notebook results (per-victim pickles, tuning runs)
 results/
+
+# CSVs written by src/datasets.py, and the downloaded MNIST files
+notebooks/data/
+data/
 
 # conda installer
 Miniforge3.sh

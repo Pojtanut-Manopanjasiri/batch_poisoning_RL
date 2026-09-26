@@ -7,7 +7,7 @@ from env import random_feasible_action
 
 
 def _mlp(sizes):
-    """Tanh MLP (same activation as ValueNet, for a like-for-like function class)."""
+    """Tanh MLP."""
     layers = []
     for i in range(len(sizes) - 1):
         layers.append(nn.Linear(sizes[i], sizes[i + 1]))
@@ -17,11 +17,7 @@ def _mlp(sizes):
 
 
 class BranchQNet(nn.Module):
-    """Q_i(s, a_i) for every point i and sub-action a_i in {0, ..., L}.
-
-    Returns (batch, m, L+1).  Dueling with local-mean aggregation: the shared state value
-    V(s) carries the level, each branch's centred advantage carries the choice.
-    """
+    """Q_i(s, a_i) for every point i and sub-action a_i in {0, ..., L}.  """
 
     def __init__(self, d, T, hidden=(128, 128), L=2):
         super().__init__()
@@ -48,14 +44,16 @@ class BranchQNet(nn.Module):
 
 
 def _features(env, theta, z):
-    """State/point features for one (theta, z): err, phi (m,d), resid (m).
-
-    The residual comes from the victim so BDQ sees the task-correct quantity
-    (least-squares vs logistic) -- same features either way, no BDQ change needed.
-    """
     resid = env.victim.residual(theta, z)
     phi = env.victim.phi_batch(theta, z)
     return theta - env.theta_target, phi, resid
+
+
+def _features_batch(env, thetas, zx, zy):
+    resid, phi = torch.func.vmap(
+        lambda th, x, y: (env.victim.residual(th, (x, y)), env.victim.phi_batch(th, (x, y)))
+    )(thetas, zx, zy)
+    return thetas - env.theta_target, phi, resid
 
 
 def _q_values(net, env, theta, z, t):
@@ -64,18 +62,7 @@ def _q_values(net, env, theta, z, t):
     return net(theta[None], err[None], torch.tensor([t], device=theta.device),
                phi[None], resid[None])[0]
 
-
-# --------------------------------------------------------------------------- #
-# Feasibility projection (mirrors selection._select_greedy, on Q-margins)
-# --------------------------------------------------------------------------- #
 def project_action(q, balance=True, B=None, L=2):
-    """Feasible action from per-branch Q-values q (m, L+1), minimising cost.
-
-    Same Algorithm-2 allocation as `_select_greedy`, with the marginal cost of raising
-    point i from level s taken as Q_i(s+1) - Q_i(s) instead of alpha_i +/- rho, so both
-    methods face the identical constraint and differ only in scoring.
-    """
-    # allocated on CPU: the loop below reads an argmin back on every step
     device = q.device
     return _project_cpu(q.detach().cpu(), balance, B, L).to(device)
 
@@ -160,15 +147,15 @@ def _stack(env, batch):
     done = torch.tensor([b[7] for b in batch], dtype=torch.float32, device=dev)
 
     def feat(thetas, zs):
-        errs, phis, resids = zip(*[_features(env, thetas[i], zs[i]) for i in range(len(zs))])
-        return torch.stack(errs), torch.stack(phis), torch.stack(resids)
+        return _features_batch(env, thetas, torch.stack([x for x, _ in zs]),
+                               torch.stack([y for _, y in zs]))
 
     return (th, *feat(th, z), t, a, c, th_n, *feat(th_n, z_n), done)
 
 
 def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
               best_checkpoint=True, eval_episodes=100, eval_seed=999):
-    """Train BDQ. Same outer loop / budget as train_fvi, so the comparison is fair."""
+    """Train BDQ. Same outer loop / budget as train_rfevi, so the comparison is fair."""
     from fvi import eps_schedule, evaluate
 
     rng = torch.Generator().manual_seed(seed)
@@ -179,7 +166,6 @@ def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
     history, best_cost, best_state = [], float("inf"), None
 
     for k in range(cfg.K_iters):
-        # --- 1. collect episodes under the current epsilon-greedy policy ---
         eps = eps_schedule(k, cfg.K_iters, cfg.eps_start, cfg.eps_end)
         transitions = []
         for _ in range(cfg.N_episodes):
@@ -195,23 +181,22 @@ def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
                 theta, z = theta_next, z_next
         buffer.push(transitions)
 
-        # --- 2. fit against a frozen target net ---
         target_net = copy.deepcopy(net)
         for _ in range(cfg.n_grad_steps):
             (th, err, phi, res, t, a, c,
              th_n, err_n, phi_n, res_n, done) = _stack(env, buffer.sample(cfg.batch_size, rng))
 
             with torch.no_grad():
-                q_next_online = net(th_n, err_n, t + 1, phi_n, res_n)      # double-Q
+                q_next_online = net(th_n, err_n, t + 1, phi_n, res_n)     
                 a_star = q_next_online.argmin(dim=-1, keepdim=True)
                 q_next = target_net(th_n, err_n, t + 1, phi_n, res_n)
-                boot = q_next.gather(-1, a_star).squeeze(-1)               # (B, m)
-                boot = boot.mean(dim=1) * (1.0 - done)     # target_version='mean'; 0 if terminal
-                y = c + boot                                              # gamma = 1
+                boot = q_next.gather(-1, a_star).squeeze(-1)             
+                boot = boot.mean(dim=1) * (1.0 - done)    
+                y = c + boot                                           
 
             q = net(th, err, phi=phi, resid=res, t=t)
-            q_taken = q.gather(-1, a[..., None]).squeeze(-1)               # (B, m)
-            loss = ((q_taken - y[:, None]) ** 2).mean()   # losses_version=2 (mean over branches)
+            q_taken = q.gather(-1, a[..., None]).squeeze(-1)             
+            loss = ((q_taken - y[:, None]) ** 2).mean() 
 
             opt.zero_grad()
             loss.backward()

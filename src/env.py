@@ -1,32 +1,10 @@
-"""Environment and victim (reconstructed minimal Brief I).
-
-State  s_t = (theta_t, z_t),  theta in R^d,  batch z of m i.i.d. points.
-Action a in {0,...,L}^m  (0 delete, 1 keep, l>1 duplicate l-1 times).
-
-Transition is action-linear (the whole decomposition rests on this):
-
-    theta_{t+1} = theta_t + sum_i a_i * phi_i ,   phi_i = -(eta/m) grad_theta l_i .
-
-Cost (minimisation, ZZL convention):
-
-    g = c_edit * sum_i |a_i - 1|            (perturbation / total-variation)
-      + (lam/2) * ||theta_{t+1} - theta_target||^2   (nefarious)
-"""
+import dataclasses
 import functools
 
 import torch
 
 
 class Stream:
-    """I.i.d. data stream P_Z: z = (x, y), x ~ N(0, I_d).
-
-    task="regression": y = <x, theta_star> + noise*N(0,1)      (real-valued)
-    task="logistic"  : y ~ Bernoulli(sigmoid(<x, theta_star>)) (binary), then each
-                       label is flipped with probability `noise`.
-    task="mlp"       : y = sin(<x, theta_star>) + noise*N(0,1) (real-valued, non-linear
-                       target -- gives the MLP victim something a linear model can't fit).
-    """
-
     def __init__(self, cfg):
         self.d = cfg.d
         self.noise = cfg.noise
@@ -34,6 +12,8 @@ class Stream:
         self.device = torch.device(cfg.device)
         g = torch.Generator().manual_seed(cfg.seed)
         self.theta_star = torch.randn(cfg.d, generator=g)
+        if cfg.theta_star_norm is not None:                    
+            self.theta_star *= cfg.theta_star_norm / self.theta_star.norm()
 
     def sample_batch(self, m, rng):
         x, y = self._sample_cpu(m, rng)
@@ -44,7 +24,7 @@ class Stream:
         if self.task == "logistic":
             p = torch.sigmoid(x @ self.theta_star)
             y = (torch.rand(m, generator=rng) < p).float()
-            if self.noise > 0:                                   # symmetric label flips
+            if self.noise > 0:                                   
                 flip = torch.rand(m, generator=rng) < self.noise
                 y = torch.where(flip, 1.0 - y, y)
         elif self.task == "mlp":
@@ -54,25 +34,31 @@ class Stream:
         return (x, y)
 
 
+class DatasetStream:
+    """Batches drawn uniformly, with replacement, from a fixed standardised dataset."""
+
+    def __init__(self, cfg):
+        from datasets import load_dataset
+        X, y = load_dataset(cfg.dataset, cfg.dataset_n, cfg.dataset_noise, seed=cfg.seed,
+                            pca=cfg.dataset_pca)
+        self.X = torch.tensor(X, dtype=torch.float32)
+        y = torch.tensor(y, dtype=torch.float32)
+        self.y = (y > 0).float() if cfg.task == "logistic" else y  
+        self.d, self.noise, self.task = self.X.shape[1], cfg.noise, cfg.task
+        self.device = torch.device(cfg.device)
+        self.theta_star = torch.linalg.lstsq(self.X, y[:, None]).solution[:, 0]  
+
+    def sample_batch(self, m, rng):
+        i = torch.randint(0, len(self.y), (m,), generator=rng)
+        return (self.X[i].to(self.device), self.y[i].to(self.device))
+
+
 class Victim:
-    """Online mini-batch GD victim.  Per-point loss:
-
-        regression: l_i = 1/2 (<theta,x_i> - y_i)^2          -> grad = (<theta,x_i> - y_i) x_i
-        logistic  : l_i = BCE(sigmoid(<theta,x_i>), y_i)     -> grad = (sigmoid(<theta,x_i>) - y_i) x_i
-
-    Both have gradient `resid_i * x_i` -- only the definition of the residual changes,
-    so action-linearity (and hence the whole decomposition) is untouched.
-
-    phi_batch returns Phi in R^{m x d} whose rows are phi_i (the per-point
-    contribution to the update).  No clipping / normalisation: linearity must hold.
-    """
-
     def __init__(self, cfg):
         self.eta = cfg.eta
         self.task = cfg.task
 
     def residual(self, theta, z):
-        """(m,) per-point residual r_i; grad of l_i is r_i * x_i for both tasks."""
         x, y = z
         pred = x @ theta
         if self.task == "logistic":
@@ -82,32 +68,19 @@ class Victim:
     def phi_batch(self, theta, z):
         x, _ = z
         m = x.shape[0]
-        resid = self.residual(theta, z)  # (m,)  residuals r_i
-        grad = resid[:, None] * x        # (m, d) per-point gradient r_i * x_i
-        return -(self.eta / m) * grad    # (m, d) = Phi, rows phi_i
+        resid = self.residual(theta, z) 
+        grad = resid[:, None] * x        
+        return -(self.eta / m) * grad  
 
     def update(self, theta, z, a):
         Phi = self.phi_batch(theta, z)
-        return theta + a @ Phi           # theta + sum_i a_i phi_i
+        return theta + a @ Phi         
 
 
 class MLPVictim:
-    """Small neural-network victim: theta is the FLATTENED parameter vector.
-
-        f(x; theta) = W2 tanh(W1 x + b1) + b2 ,   l_i = 1/2 (f(x_i) - y_i)^2
-
-    Action-linearity is unchanged -- one SGD step on the reweighted batch loss is still
-    theta + sum_i a_i phi_i with phi_i = -(eta/m) grad_theta l_i -- because the batch
-    gradient is a sum over points whatever the model is. Only phi_batch gets harder: we
-    need PER-SAMPLE gradients, which torch.func.vmap(grad(.)) gives in one pass.
-
-    Note the parameter dimension D (not the data dimension d) is what theta lives in, so
-    env.d == D for this task. Keep victim_hidden small: D enters the value network's input.
-    """
-
     def __init__(self, cfg):
         self.eta, self.d_in, self.h = cfg.eta, cfg.d, cfg.victim_hidden
-        self.shapes = [(self.h, self.d_in), (self.h,), (self.h,), ()]   # W1, b1, W2, b2
+        self.shapes = [(self.h, self.d_in), (self.h,), (self.h,), ()]   
         self.sizes = [self.h * self.d_in, self.h, self.h, 1]
         self.D = sum(self.sizes)
         self.task = "mlp"
@@ -117,7 +90,7 @@ class MLPVictim:
         for s, n in zip(self.shapes, self.sizes):
             out.append(theta[i:i + n].reshape(s) if s else theta[i])
             i += n
-        return out                                   # W1 (h,d), b1 (h), W2 (h,), b2 ()
+        return out                                 
 
     def forward(self, theta, x):
         W1, b1, W2, b2 = self.unflatten(theta)
@@ -135,7 +108,7 @@ class MLPVictim:
             return 0.5 * (self.forward(th, xi[None])[0] - yi) ** 2
 
         g = torch.func.vmap(torch.func.grad(loss_one), in_dims=(None, 0, 0))(
-            theta.detach(), x, y)                    # (m, D) per-sample gradients
+            theta.detach(), x, y)                   
         return -(self.eta / m) * g
 
     def update(self, theta, z, a):
@@ -144,11 +117,9 @@ class MLPVictim:
 
 @functools.cache
 def _use_stock_cuda_kernels():
-    # torch sends the bmm inside vmap(grad)'s backward to a Triton kernel, which compiles
-    # a C launcher on first use and fails on machines without a C compiler
     try:
         from torch._native.registry import deregister_op_overrides
-    except ImportError:                      # torch without the Triton override layer
+    except ImportError:                      
         return
     deregister_op_overrides(disable_dsl_names="triton")
 
@@ -157,16 +128,15 @@ class Environment:
     """Bundles stream + victim + attacker target and exposes cost / reset."""
 
     def __init__(self, env_cfg, method_cfg):
-        self._env_cfg = env_cfg          # kept so diagnostics can rebuild with new eta
-        self.stream = Stream(env_cfg)
+        if env_cfg.dataset is not None:  
+            from datasets import n_features
+            env_cfg = dataclasses.replace(env_cfg, d=n_features(env_cfg.dataset, env_cfg.dataset_pca))
+        self._env_cfg = env_cfg         
+        self.stream = DatasetStream(env_cfg) if env_cfg.dataset is not None else Stream(env_cfg)
         g = torch.Generator().manual_seed(env_cfg.seed + 1)
         if env_cfg.task == "mlp":
             self.victim = MLPVictim(env_cfg)
-            self.d = self.victim.D                       # theta lives in parameter space
-            # a zero start is degenerate for an MLP (symmetric, zero gradient), so the
-            # episode starts from a small random init; the target uses a larger scale
-            # so f(.;theta_target) is visibly non-linear (small weights keep tanh in
-            # its near-linear regime).
+            self.d = self.victim.D                     
             self.theta_0 = env_cfg.init_scale * torch.randn(self.d, generator=g)
             self.theta_target = env_cfg.target_scale * torch.randn(self.d, generator=g)
         else:
@@ -181,17 +151,20 @@ class Environment:
         self.theta_target = self.theta_target.to(self.device)
         self.m, self.T = env_cfg.m, env_cfg.T
         self.lam = method_cfg.lam
-        self.c_edit = method_cfg.c_edit
+        self.rho = method_cfg.lam / (2 * env_cfg.m)     
 
     def cost(self, theta, z, a, theta_next):
         edits = torch.abs(a - 1.0).sum()
-        nefarious = 0.5 * self.lam * ((theta_next - self.theta_target) ** 2).sum()
-        return float(self.c_edit * edits + nefarious)
+        nefarious = 0.5 * ((theta_next - self.theta_target) ** 2).sum()
+        return float(self.rho * edits + nefarious)
+
+    def cost_batch(self, a, theta_next):
+        """cost for S transitions: a (S, m), theta_next (S, d) -> (S,)."""
+        edits = torch.abs(a - 1.0).sum(1)
+        nefarious = 0.5 * ((theta_next - self.theta_target) ** 2).sum(1)
+        return self.rho * edits + nefarious
 
 
-# --------------------------------------------------------------------------- #
-# Feasibility helpers (balance / budget)
-# --------------------------------------------------------------------------- #
 def is_feasible(a, balance=True, B=None, L=2):
     """a_i in {0,...,L};  sum_i a_i = m (balance);  ||a - 1||_1 <= B."""
     if bool((a < 0).any()) or bool((a > L).any()):
@@ -204,7 +177,6 @@ def is_feasible(a, balance=True, B=None, L=2):
 
 
 def random_feasible_action(m, rng, balance=True, B=None, L=2, device="cpu"):
-    """Random feasible action via the Algorithm-2 allocation with random ties."""
     return _random_feasible_cpu(m, rng, balance, B, L).to(device)
 
 
@@ -222,7 +194,7 @@ def _random_feasible_cpu(m, rng, balance, B, L):
                 budget -= abs(lvl - 1)
         return a
 
-    k = m if B is None else B // 2       # ||a-1||_1 = 2D under sum a = m
+    k = m if B is None else B // 2      
     a = torch.zeros(m)
     D = 0
     for _ in range(m):
