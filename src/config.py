@@ -14,11 +14,15 @@ class EnvConfig:
     dataset: str | None = None    
     dataset_n: int = 10000          
     dataset_noise: float = 0.0     
-    dataset_pca: int | None = 30   
+    dataset_pca: int | None = 30
+    dataset_test: float = 0.2              # held-out share for scoring the victim (mnist: its 10k test images); 0: the pool
     task: str = "regression"
-    victim_hidden: int = 8    
-    init_scale: float = 0.3    
-    target_scale: float = 1.0 
+    victim_hidden: int = 8
+    victim_depth: int = 1                  # mlp victim: hidden layers of width victim_hidden
+    victim_act: str = "tanh"               # mlp victim: tanh | relu | gelu
+    init_scale: float = 0.3
+    target_scale: float = 1.0
+    target_steps: int | None = None        # None: random target; N: victim's SGD on flipped labels for N steps
     device: str = "cpu"      
 
 
@@ -48,6 +52,9 @@ class MethodConfig:
     trpo_minibatch: int = 64        
     trpo_vf_iters: int = 40         
     trpo_vf_lr: float = 1e-3
+    trpo_actor: str = "alloc"       # "alloc": exact Gibbs allocation (alloc_policy.py) | "swap"
+    myopic_prior: bool = False      # TRPO/BDQ: add the separable one-step score (bdq._myopic_scores), learn only the correction
+    trpo_prior_beta: float = 5.0    # TRPO with myopic_prior: initial inverse temperature (learned)
 
     fevi_N: int = 200              
     fevi_M: int = 5                

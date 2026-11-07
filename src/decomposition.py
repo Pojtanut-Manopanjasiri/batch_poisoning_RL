@@ -1,6 +1,5 @@
 import torch
 
-
 def alpha_batch(V_psi, theta, t_next, Phi, theta_target):
     theta_ = theta.detach().requires_grad_(True)
     gradV, = torch.autograd.grad(V_psi(theta_, t_next).sum(), theta_)      # (S, d)

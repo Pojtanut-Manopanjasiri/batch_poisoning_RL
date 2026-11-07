@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import math
 
 import torch
 
@@ -38,12 +39,15 @@ class DatasetStream:
     """Batches drawn uniformly, with replacement, from a fixed standardised dataset."""
 
     def __init__(self, cfg):
-        from datasets import load_dataset
-        X, y = load_dataset(cfg.dataset, cfg.dataset_n, cfg.dataset_noise, seed=cfg.seed,
-                            pca=cfg.dataset_pca)
+        from datasets import load_split
+        X, y, Xt, yt = load_split(cfg.dataset, cfg.dataset_n, cfg.dataset_noise, seed=cfg.seed,
+                                  pca=cfg.dataset_pca, test=cfg.dataset_test)
         self.X = torch.tensor(X, dtype=torch.float32)
         y = torch.tensor(y, dtype=torch.float32)
-        self.y = (y > 0).float() if cfg.task == "logistic" else y  
+        self.y = (y > 0).float() if cfg.task == "logistic" else y
+        self.X_test = torch.tensor(Xt, dtype=torch.float32)       # held-out: never sampled, only for scoring
+        yt = torch.tensor(yt, dtype=torch.float32)
+        self.y_test = (yt > 0).float() if cfg.task == "logistic" else yt
         self.d, self.noise, self.task = self.X.shape[1], cfg.noise, cfg.task
         self.device = torch.device(cfg.device)
         self.theta_star = torch.linalg.lstsq(self.X, y[:, None]).solution[:, 0]  
@@ -77,11 +81,20 @@ class Victim:
         return theta + a @ Phi         
 
 
+ACTIVATIONS = {"tanh": torch.tanh, "relu": torch.relu, "gelu": torch.nn.functional.gelu}
+
+
 class MLPVictim:
     def __init__(self, cfg):
-        self.eta, self.d_in, self.h = cfg.eta, cfg.d, cfg.victim_hidden
-        self.shapes = [(self.h, self.d_in), (self.h,), (self.h,), ()]   
-        self.sizes = [self.h * self.d_in, self.h, self.h, 1]
+        if cfg.victim_act not in ACTIVATIONS:
+            raise ValueError(f"victim_act {cfg.victim_act!r}; expected one of {list(ACTIVATIONS)}")
+        self.eta, self.d_in, self.h, self.depth = cfg.eta, cfg.d, cfg.victim_hidden, cfg.victim_depth
+        self.act = ACTIVATIONS[cfg.victim_act]
+        self.shapes = []
+        for l in range(self.depth):                     # W_l, b_l per hidden layer, then output w, b
+            self.shapes += [(self.h, self.d_in if l == 0 else self.h), (self.h,)]
+        self.shapes += [(self.h,), ()]
+        self.sizes = [math.prod(s) for s in self.shapes]
         self.D = sum(self.sizes)
         self.task = "mlp"
 
@@ -90,11 +103,13 @@ class MLPVictim:
         for s, n in zip(self.shapes, self.sizes):
             out.append(theta[i:i + n].reshape(s) if s else theta[i])
             i += n
-        return out                                 
+        return out
 
     def forward(self, theta, x):
-        W1, b1, W2, b2 = self.unflatten(theta)
-        return torch.tanh(x @ W1.T + b1) @ W2 + b2   # (m,)
+        *hidden, w, b = self.unflatten(theta)
+        for W, c in zip(hidden[::2], hidden[1::2]):
+            x = self.act(x @ W.T + c)
+        return x @ w + b                            # (m,)
 
     def residual(self, theta, z):
         x, y = z
@@ -112,7 +127,10 @@ class MLPVictim:
         return -(self.eta / m) * g
 
     def update(self, theta, z, a):
-        return theta + a @ self.phi_batch(theta, z)
+        theta_next = theta + a @ self.phi_batch(theta, z)
+        if not bool(torch.isfinite(theta_next).all()):
+            raise FloatingPointError(f"mlp victim diverged (eta={self.eta}): lower eta or init_scale")
+        return theta_next
 
 
 @functools.cache
@@ -149,9 +167,20 @@ class Environment:
             _use_stock_cuda_kernels()
         self.theta_0 = self.theta_0.to(self.device)
         self.theta_target = self.theta_target.to(self.device)
+        if env_cfg.target_steps:              # target model: the victim's own clean SGD on flipped labels
+            self.theta_target = self._trained_target(env_cfg.target_steps, env_cfg.m,
+                                                     torch.Generator().manual_seed(env_cfg.seed + 2))
         self.m, self.T = env_cfg.m, env_cfg.T
         self.lam = method_cfg.lam
         self.rho = method_cfg.lam / (2 * env_cfg.m)     
+
+    def _trained_target(self, steps, m, rng):
+        theta = self.theta_0.clone()
+        for _ in range(steps):
+            x, y = self.stream.sample_batch(m, rng)
+            y = 1.0 - y if self.victim.task == "logistic" else -y
+            theta = self.victim.update(theta, (x, y), torch.ones(m, device=self.device)).detach()
+        return theta
 
     def cost(self, theta, z, a, theta_next):
         edits = torch.abs(a - 1.0).sum()

@@ -16,26 +16,47 @@ def _mlp(sizes):
     return nn.Sequential(*layers)
 
 
+def _myopic_scores(err, phi, rho, L):
+    # separable one-step cost of level l around a = 1: <e0, phi_i> dl + |phi_i|^2 dl^2 / 2 + rho |dl|
+    dl = torch.arange(L + 1, device=phi.device, dtype=phi.dtype) - 1
+    alpha = torch.einsum("bmd,bd->bm", phi, err + phi.sum(1))      # e0: error after the clean step
+    sq = (phi * phi).sum(-1)
+    return alpha[..., None] * dl + 0.5 * sq[..., None] * dl ** 2 + rho * dl.abs()
+
+
+def _mean_cost(env, agent, seed, n):
+    # same episodes as evaluate(); separate so wrappers around evaluate() don't log it
+    from fvi import rollout
+    rng = torch.Generator().manual_seed(seed)
+    return sum(rollout(env, agent, rng)[1] for _ in range(n)) / n
+
+
 class BranchQNet(nn.Module):
     """Q_i(s, a_i) for every point i and sub-action a_i in {0, ..., L}.  """
 
-    def __init__(self, d, T, hidden=(128, 128), L=2):
+    def __init__(self, d, T, hidden=(128, 128), L=2, prior_rho=None):
         super().__init__()
         self.d, self.T, self.n_sub = d, T, L + 1
+        self.prior_rho = prior_rho                       # set: advantages = greedy's score + learned correction
         h = hidden[-1]
-        self.torso = _mlp([2 * d + T, *hidden])          # theta, error, t one-hot
+        self.torso = _mlp([3 * d + T, *hidden])          # theta, error, clean step sum_j phi_j, t one-hot
         self.point_enc = _mlp([d + 1, *hidden])          # phi_i, resid_i
         self.adv_head = _mlp([2 * h, *hidden, self.n_sub])   # per-branch advantages
         self.value_head = _mlp([2 * h, *hidden, 1])          # shared state value
+        if prior_rho is not None:                        # correction starts at zero: acts as the separable prior
+            nn.init.zeros_(self.adv_head[-1].weight)
+            nn.init.zeros_(self.adv_head[-1].bias)
 
     def forward(self, theta, err, t, phi, resid):
         """theta,err (B,d); t (B,) long; phi (B,m,d); resid (B,m) -> Q (B,m,3)."""
         t_oh = torch.nn.functional.one_hot(t.clamp(max=self.T - 1), self.T).float()
-        h_s = self.torso(torch.cat([theta, err, t_oh], dim=-1))          # (B, h)
+        h_s = self.torso(torch.cat([theta, err, phi.sum(1), t_oh], dim=-1))   # (B, h)
         h_p = self.point_enc(torch.cat([phi, resid[..., None]], dim=-1))  # (B, m, h)
 
         h_s_exp = h_s[:, None, :].expand(-1, h_p.shape[1], -1)
         adv = self.adv_head(torch.cat([h_s_exp, h_p], dim=-1))            # (B, m, 3)
+        if self.prior_rho is not None:
+            adv = adv + _myopic_scores(err, phi, self.prior_rho, self.n_sub - 1)
         adv = adv - adv.mean(dim=-1, keepdim=True)          # reduceLocalMean aggregator
 
         pooled = h_p.mean(dim=1)                            # permutation-invariant summary
@@ -159,11 +180,15 @@ def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
     from fvi import eps_schedule, evaluate
 
     rng = torch.Generator().manual_seed(seed)
-    net = BranchQNet(env.d, env.T, cfg.hidden, cfg.L).to(env.device)
+    net = BranchQNet(env.d, env.T, cfg.hidden, cfg.L,
+                     env.rho if cfg.myopic_prior else None).to(env.device)
     agent = BDQAgent(net, env, cfg, rng)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     buffer = BDQBuffer(cfg.buffer_capacity)
     history, best_cost, best_state = [], float("inf"), None
+    if cfg.myopic_prior and best_checkpoint:          # untrained = the separable prior: the first checkpoint
+        best_cost = _mean_cost(env, agent, eval_seed, eval_episodes)
+        best_state = copy.deepcopy(net.state_dict())
 
     for k in range(cfg.K_iters):
         eps = eps_schedule(k, cfg.K_iters, cfg.eps_start, cfg.eps_end)
