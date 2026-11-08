@@ -1,26 +1,3 @@
-"""BDQ baseline: Branching Dueling Q-Network for batch-curation poisoning.
-
-Model-free comparison point for our FVI + decomposition method.  PyTorch port of
-Tavakoli et al., "Action Branching Architectures for Deep RL" (AAAI 2018) --
-github.com/atavakol/action-branching-agents (MIT, (c) 2018 Arash Tavakoli) -- at the
-paper's best settings: dueling with reduceLocalMean, one shared target averaged over
-branches, per-branch TD loss averaged over branches, double-Q.
-
-Branching is what makes 3^m (59049 at m=10) tractable: m branches of 3 sub-actions,
-linear in m rather than exponential.
-
-Four adaptations forced by our setting (comparison caveats in the README):
-
- 1. COST, NOT REWARD.  max/argmax -> min/argmin; gamma = 1; terminal Q = 0 at t = T.
- 2. THE BATCH IS IN THE STATE.  s_t = (theta_t, z_t), so branch i must see its own point:
-    shared state torso + shared per-point encoder over (phi_i, resid_i) + weight-shared
-    branch heads, which also makes the net independent of m.
- 3. FEASIBILITY.  Independent branches break sum a_i = m, so we project with the SAME
-    Algorithm-2 allocation as selection, ranked by Q-margins instead of alpha --
-    only the scoring differs between methods, not the constraint handling.
- 4. c_edit IS LEARNED.  BDQ sees it only through observed cost; our method has it
-    analytically.  That asymmetry is the point of the comparison.
-"""
 import copy
 
 import torch
@@ -30,7 +7,7 @@ from env import random_feasible_action
 
 
 def _mlp(sizes):
-    """Tanh MLP (same activation as ValueNet, for a like-for-like function class)."""
+    """Tanh MLP."""
     layers = []
     for i in range(len(sizes) - 1):
         layers.append(nn.Linear(sizes[i], sizes[i + 1]))
@@ -39,30 +16,47 @@ def _mlp(sizes):
     return nn.Sequential(*layers)
 
 
+def _myopic_scores(err, phi, rho, L):
+    # separable one-step cost of level l around a = 1: <e0, phi_i> dl + |phi_i|^2 dl^2 / 2 + rho |dl|
+    dl = torch.arange(L + 1, device=phi.device, dtype=phi.dtype) - 1
+    alpha = torch.einsum("bmd,bd->bm", phi, err + phi.sum(1))      # e0: error after the clean step
+    sq = (phi * phi).sum(-1)
+    return alpha[..., None] * dl + 0.5 * sq[..., None] * dl ** 2 + rho * dl.abs()
+
+
+def _mean_cost(env, agent, seed, n):
+    # same episodes as evaluate(); separate so wrappers around evaluate() don't log it
+    from fvi import rollout
+    rng = torch.Generator().manual_seed(seed)
+    return sum(rollout(env, agent, rng)[1] for _ in range(n)) / n
+
+
 class BranchQNet(nn.Module):
-    """Q_i(s, a_i) for every point i and sub-action a_i in {0, ..., L}.
+    """Q_i(s, a_i) for every point i and sub-action a_i in {0, ..., L}.  """
 
-    Returns (batch, m, L+1).  Dueling with local-mean aggregation: the shared state value
-    V(s) carries the level, each branch's centred advantage carries the choice.
-    """
-
-    def __init__(self, d, T, hidden=(128, 128), L=2):
+    def __init__(self, d, T, hidden=(128, 128), L=2, prior_rho=None):
         super().__init__()
         self.d, self.T, self.n_sub = d, T, L + 1
+        self.prior_rho = prior_rho                       # set: advantages = greedy's score + learned correction
         h = hidden[-1]
-        self.torso = _mlp([2 * d + T, *hidden])          # theta, error, t one-hot
+        self.torso = _mlp([3 * d + T, *hidden])          # theta, error, clean step sum_j phi_j, t one-hot
         self.point_enc = _mlp([d + 1, *hidden])          # phi_i, resid_i
         self.adv_head = _mlp([2 * h, *hidden, self.n_sub])   # per-branch advantages
         self.value_head = _mlp([2 * h, *hidden, 1])          # shared state value
+        if prior_rho is not None:                        # correction starts at zero: acts as the separable prior
+            nn.init.zeros_(self.adv_head[-1].weight)
+            nn.init.zeros_(self.adv_head[-1].bias)
 
     def forward(self, theta, err, t, phi, resid):
         """theta,err (B,d); t (B,) long; phi (B,m,d); resid (B,m) -> Q (B,m,3)."""
         t_oh = torch.nn.functional.one_hot(t.clamp(max=self.T - 1), self.T).float()
-        h_s = self.torso(torch.cat([theta, err, t_oh], dim=-1))          # (B, h)
+        h_s = self.torso(torch.cat([theta, err, phi.sum(1), t_oh], dim=-1))   # (B, h)
         h_p = self.point_enc(torch.cat([phi, resid[..., None]], dim=-1))  # (B, m, h)
 
         h_s_exp = h_s[:, None, :].expand(-1, h_p.shape[1], -1)
         adv = self.adv_head(torch.cat([h_s_exp, h_p], dim=-1))            # (B, m, 3)
+        if self.prior_rho is not None:
+            adv = adv + _myopic_scores(err, phi, self.prior_rho, self.n_sub - 1)
         adv = adv - adv.mean(dim=-1, keepdim=True)          # reduceLocalMean aggregator
 
         pooled = h_p.mean(dim=1)                            # permutation-invariant summary
@@ -71,34 +65,31 @@ class BranchQNet(nn.Module):
 
 
 def _features(env, theta, z):
-    """State/point features for one (theta, z): err, phi (m,d), resid (m).
-
-    The residual comes from the victim so BDQ sees the task-correct quantity
-    (least-squares vs logistic) -- same features either way, no BDQ change needed.
-    """
     resid = env.victim.residual(theta, z)
     phi = env.victim.phi_batch(theta, z)
     return theta - env.theta_target, phi, resid
 
 
+def _features_batch(env, thetas, zx, zy):
+    resid, phi = torch.func.vmap(
+        lambda th, x, y: (env.victim.residual(th, (x, y)), env.victim.phi_batch(th, (x, y)))
+    )(thetas, zx, zy)
+    return thetas - env.theta_target, phi, resid
+
+
 def _q_values(net, env, theta, z, t):
     """Q for a single state -> (m, 3)."""
     err, phi, resid = _features(env, theta, z)
-    return net(theta[None], err[None], torch.tensor([t]), phi[None], resid[None])[0]
+    return net(theta[None], err[None], torch.tensor([t], device=theta.device),
+               phi[None], resid[None])[0]
 
-
-# --------------------------------------------------------------------------- #
-# Feasibility projection (mirrors selection._select_greedy, on Q-margins)
-# --------------------------------------------------------------------------- #
 def project_action(q, balance=True, B=None, L=2):
-    """Feasible action from per-branch Q-values q (m, L+1), minimising cost.
+    device = q.device
+    return _project_cpu(q.detach().cpu(), balance, B, L).to(device)
 
-    Same Algorithm-2 allocation as `_select_greedy`, with the marginal cost of raising
-    point i from level s taken as Q_i(s+1) - Q_i(s) instead of alpha_i +/- rho, so both
-    methods face the identical constraint and differ only in scoring.
-    """
+
+def _project_cpu(q, balance, B, L):
     m = q.shape[0]
-    q = q.detach()
 
     if not balance:
         a = q.argmin(dim=1)
@@ -138,7 +129,8 @@ class BDQAgent:
     def act(self, theta, z, t, epsilon=0.0):
         m = z[0].shape[0]
         if epsilon > 0 and float(torch.rand(1, generator=self.rng)) < epsilon:
-            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B, self.cfg.L)
+            return random_feasible_action(m, self.rng, self.cfg.balance, self.cfg.B,
+                                          self.cfg.L, device=z[0].device)
         q = _q_values(self.net, self.env, theta, z, t)
         return project_action(q, self.cfg.balance, self.cfg.B, self.cfg.L)
 
@@ -166,35 +158,39 @@ class BDQBuffer:
 def _stack(env, batch):
     """Collate sampled transitions into tensors for the network."""
     th = torch.stack([b[0] for b in batch])
+    dev = th.device
     z = [b[1] for b in batch]
-    t = torch.tensor([b[2] for b in batch])
+    t = torch.tensor([b[2] for b in batch], device=dev)
     a = torch.stack([b[3] for b in batch]).long()
-    c = torch.tensor([b[4] for b in batch], dtype=torch.float32)
+    c = torch.tensor([b[4] for b in batch], dtype=torch.float32, device=dev)
     th_n = torch.stack([b[5] for b in batch])
     z_n = [b[6] for b in batch]
-    done = torch.tensor([b[7] for b in batch], dtype=torch.float32)
+    done = torch.tensor([b[7] for b in batch], dtype=torch.float32, device=dev)
 
     def feat(thetas, zs):
-        errs, phis, resids = zip(*[_features(env, thetas[i], zs[i]) for i in range(len(zs))])
-        return torch.stack(errs), torch.stack(phis), torch.stack(resids)
+        return _features_batch(env, thetas, torch.stack([x for x, _ in zs]),
+                               torch.stack([y for _, y in zs]))
 
     return (th, *feat(th, z), t, a, c, th_n, *feat(th_n, z_n), done)
 
 
 def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
               best_checkpoint=True, eval_episodes=100, eval_seed=999):
-    """Train BDQ. Same outer loop / budget as train_fvi, so the comparison is fair."""
+    """Train BDQ. Same outer loop / budget as train_rfevi, so the comparison is fair."""
     from fvi import eps_schedule, evaluate
 
     rng = torch.Generator().manual_seed(seed)
-    net = BranchQNet(env.d, env.T, cfg.hidden, cfg.L)
+    net = BranchQNet(env.d, env.T, cfg.hidden, cfg.L,
+                     env.rho if cfg.myopic_prior else None).to(env.device)
     agent = BDQAgent(net, env, cfg, rng)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     buffer = BDQBuffer(cfg.buffer_capacity)
     history, best_cost, best_state = [], float("inf"), None
+    if cfg.myopic_prior and best_checkpoint:          # untrained = the separable prior: the first checkpoint
+        best_cost = _mean_cost(env, agent, eval_seed, eval_episodes)
+        best_state = copy.deepcopy(net.state_dict())
 
     for k in range(cfg.K_iters):
-        # --- 1. collect episodes under the current epsilon-greedy policy ---
         eps = eps_schedule(k, cfg.K_iters, cfg.eps_start, cfg.eps_end)
         transitions = []
         for _ in range(cfg.N_episodes):
@@ -210,23 +206,22 @@ def train_bdq(env, cfg, seed=0, verbose=True, return_history=False,
                 theta, z = theta_next, z_next
         buffer.push(transitions)
 
-        # --- 2. fit against a frozen target net ---
         target_net = copy.deepcopy(net)
         for _ in range(cfg.n_grad_steps):
             (th, err, phi, res, t, a, c,
              th_n, err_n, phi_n, res_n, done) = _stack(env, buffer.sample(cfg.batch_size, rng))
 
             with torch.no_grad():
-                q_next_online = net(th_n, err_n, t + 1, phi_n, res_n)      # double-Q
+                q_next_online = net(th_n, err_n, t + 1, phi_n, res_n)     
                 a_star = q_next_online.argmin(dim=-1, keepdim=True)
                 q_next = target_net(th_n, err_n, t + 1, phi_n, res_n)
-                boot = q_next.gather(-1, a_star).squeeze(-1)               # (B, m)
-                boot = boot.mean(dim=1) * (1.0 - done)     # target_version='mean'; 0 if terminal
-                y = c + boot                                              # gamma = 1
+                boot = q_next.gather(-1, a_star).squeeze(-1)             
+                boot = boot.mean(dim=1) * (1.0 - done)    
+                y = c + boot                                           
 
             q = net(th, err, phi=phi, resid=res, t=t)
-            q_taken = q.gather(-1, a[..., None]).squeeze(-1)               # (B, m)
-            loss = ((q_taken - y[:, None]) ** 2).mean()   # losses_version=2 (mean over branches)
+            q_taken = q.gather(-1, a[..., None]).squeeze(-1)             
+            loss = ((q_taken - y[:, None]) ** 2).mean() 
 
             opt.zero_grad()
             loss.backward()

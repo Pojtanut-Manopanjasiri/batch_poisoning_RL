@@ -1,27 +1,14 @@
-"""Action selection: two tiers behind one interface  (Brief II, sec. 4.3).
-
-    greedy  -- Algorithm 2: first order, drops Gamma.  Exact for the surrogate.
-    exact   -- integer quadratic program (Gurobi, or brute force for small m).
-
-Both minimise (cost convention)
-
-    Q(a) = sum_i a_i alpha_i + 1/2 a^T Gamma a + c_edit ||a - 1||_1
-
-over A = {a in {0,...,L}^m : sum_i a_i = m, ||a - 1||_1 <= B}.
-"""
 import itertools
 import warnings
 
+import numpy as np
 import torch
 
 
-# --------------------------------------------------------------------------- #
-# small helpers
-# --------------------------------------------------------------------------- #
-def _objective(a, alpha, Gamma, c_edit):
+def _objective(a, alpha, Gamma, rho):
     edits = torch.abs(a - 1.0).sum()
     quad = 0.0 if Gamma is None else 0.5 * a @ Gamma @ a
-    return float(a @ alpha + quad + c_edit * edits)
+    return float(a @ alpha + quad + rho * edits)
 
 
 def _feasible(a, balance, B, L):
@@ -34,24 +21,14 @@ def _feasible(a, balance, B, L):
     return True
 
 
-# --------------------------------------------------------------------------- #
-# (a) greedy -- Algorithm 2, first order (drops Gamma)
-# --------------------------------------------------------------------------- #
-def _select_greedy(alpha, c_edit, B, balance, m, L):
-    """Minimise sum_i alpha_i a_i + c_edit ||a-1||_1 over A  (Algorithm 2).
-
-    Marginal cost of raising a_i from s: d_i(s) = alpha_i - rho if s == 0 else
-    alpha_i + rho.  Convex in a_i, so greedy allocation is exact.
-    """
-    rho = c_edit
+def _select_greedy(alpha, rho, B, balance, m, L):
     if not balance:
-        # each point independently: 0 if alpha_i > rho, L if alpha_i < -rho, else 1
         a = torch.ones(m)
         a[alpha > rho] = 0.0
         a[alpha < -rho] = float(L)
         if B is not None:
-            cost = (a - 1.0).abs()                       # budget each point spends
-            gain = alpha * 1.0 - alpha * a               # cost(keep) - cost(chosen)
+            cost = (a - 1.0).abs()                      
+            gain = alpha * 1.0 - alpha * a              
             gain = gain + rho * (1.0 - cost)
             spent, order = 0.0, torch.argsort(gain, descending=True)
             keep = torch.ones(m)
@@ -62,10 +39,10 @@ def _select_greedy(alpha, c_edit, B, balance, m, L):
             a = keep
         return a
 
-    k = m if B is None else B // 2       # under sum a = m, ||a-1||_1 = 2 * #dups
+    k = m if B is None else B // 2       
     a = torch.zeros(m)
-    D = 0                                # duplication increments used so far
-    for _ in range(m):                   # exactly m allocations => sum_i a_i = m
+    D = 0                              
+    for _ in range(m):                  
         d = alpha + torch.where(a == 0, -rho, rho)
         elig = (a < L) & ((a == 0) | (D < k))
         d = d.masked_fill(~elig, float("inf"))
@@ -76,14 +53,29 @@ def _select_greedy(alpha, c_edit, B, balance, m, L):
     return a
 
 
-# --------------------------------------------------------------------------- #
-# (b) exact -- integer quadratic program
-# --------------------------------------------------------------------------- #
+def select_greedy_batch(alpha, lam=0.0, B=None, balance=True, L=2):
+    S, m = alpha.shape
+    rho = lam / (2 * m)                
+    if not balance:                     
+        return torch.stack([_select_greedy(alpha[s].cpu(), rho, B, balance, m, L)
+                            for s in range(S)]).to(alpha.device)
+    k = m if B is None else B // 2
+    a = torch.zeros_like(alpha)
+    D = torch.zeros(S, device=alpha.device)
+    rows = torch.arange(S, device=alpha.device)
+    for _ in range(m):                   
+        d = alpha + torch.where(a == 0, -rho, rho)
+        elig = (a < L) & ((a == 0) | (D < k)[:, None])
+        d = d.masked_fill(~elig, float("inf"))
+        i = torch.argmin(d, dim=1)
+        D += (a[rows, i] >= 1).float()
+        a[rows, i] += 1
+    return a
+
 _FEASIBLE_CACHE = {}
 
 
 def _feasible_set(m, balance, B, L):
-    """All feasible actions as a (N, m) tensor. Cached; (L+1)^m before filtering."""
     key = (m, balance, B, L)
     if key not in _FEASIBLE_CACHE:
         acts = [torch.tensor(c, dtype=torch.float32)
@@ -93,32 +85,38 @@ def _feasible_set(m, balance, B, L):
     return _FEASIBLE_CACHE[key]
 
 
-def _select_bruteforce(alpha, Gamma, c_edit, B, balance, m, L):
+def count_feasible(m, balance, B, L):
+    states = {(0, 0): 1}
+    for _ in range(m):
+        nxt = {}
+        for (s, e), c in states.items():
+            for v in range(L + 1):
+                e2 = e + abs(v - 1)
+                if B is None or e2 <= B:
+                    nxt[(s + v, e2)] = nxt.get((s + v, e2), 0) + c
+        states = nxt
+    return sum(c for (s, _), c in states.items() if not balance or s == m)
+
+
+def _select_bruteforce(alpha, Gamma, rho, B, balance, m, L):
     A = _feasible_set(m, balance, B, L)
     edits = torch.abs(A - 1.0).sum(1)
     quad = 0.5 * (A @ Gamma * A).sum(1)
-    obj = A @ alpha + quad + c_edit * edits
+    obj = A @ alpha + quad + rho * edits
     return A[int(torch.argmin(obj))].clone()
 
 
-def _select_gurobi(alpha, Gamma, c_edit, B, balance, m, L):
+def _select_gurobi(alpha, Gamma, rho, B, balance, m, L):
     import gurobipy as gp
     from gurobipy import GRB
 
     a_np, G_np = alpha.numpy(), Gamma.numpy()
     model = gp.Model("iqp")
     model.Params.OutputFlag = 0
-    # MIPGap defaults to 1e-4 RELATIVE, and this objective drops the a-independent
-    # constant C_t, so it sits near zero and is routinely negative -- a relative
-    # tolerance is meaningless there.  Both gaps 0 => optimality proved.
+  
     model.Params.MIPGap = 0.0
     model.Params.MIPGapAbs = 0.0
     model.Params.IntFeasTol = 1e-9
-    # Gamma carries the Hessian of h and IS indefinite in practice, so the objective
-    # is nonconvex.  With L > 1 the variables are general integers rather than
-    # binaries, so Gurobi cannot linearise the products and falls back to spatial
-    # branching -- correct, but slower than the L = 1 binary case.
-    model.Params.NonConvex = 2
     a = model.addVars(m, vtype=GRB.INTEGER, lb=0, ub=L, name="a")
     dev = model.addVars(m, vtype=GRB.CONTINUOUS, lb=0.0, name="dev")   # |a_i - 1|
     for i in range(m):
@@ -130,9 +128,18 @@ def _select_gurobi(alpha, Gamma, c_edit, B, balance, m, L):
         model.addConstr(gp.quicksum(dev[i] for i in range(m)) <= B)
 
     obj = gp.quicksum(a_np[i] * a[i] for i in range(m))
-    obj += 0.5 * gp.quicksum(G_np[i, j] * a[i] * a[j]
-                             for i in range(m) for j in range(m))
-    obj += c_edit * gp.quicksum(dev[i] for i in range(m))
+    G_sym = 0.5 * (G_np + G_np.T).astype(float)
+    w, U = np.linalg.eigh(G_sym)
+    tol = 1e-5 * max(abs(w).max(), 1e-30)          
+    if w.min() < -tol:
+        raise ValueError(f"Gamma must be PSD (the Gram Phi Phi^T); min eigenvalue {w.min():.3g}")
+    
+    ks = np.where(w > tol)[0]                     
+    u = model.addVars(len(ks), lb=-GRB.INFINITY)
+    for j, k in enumerate(ks):
+        model.addConstr(u[j] == gp.quicksum(float(U[i, k]) * a[i] for i in range(m)))
+    obj += 0.5 * gp.quicksum(float(w[k]) * u[j] * u[j] for j, k in enumerate(ks))
+    obj += rho * gp.quicksum(dev[i] for i in range(m))
     model.setObjective(obj, GRB.MINIMIZE)
 
     model.optimize()
@@ -144,30 +151,33 @@ def _select_gurobi(alpha, Gamma, c_edit, B, balance, m, L):
     return torch.tensor([float(round(a[i].X)) for i in range(m)])
 
 
-def _select_exact(alpha, Gamma, c_edit, B, balance, m, L, solver):
+def _select_exact(alpha, Gamma, rho, B, balance, m, L, solver):
     try:
         if solver == "gurobi":
             import gurobipy  # noqa: F401  (probe availability)
-            return _select_gurobi(alpha, Gamma, c_edit, B, balance, m, L)
+            return _select_gurobi(alpha, Gamma, rho, B, balance, m, L)
     except ImportError:
         warnings.warn("gurobi unavailable; falling back to brute force.")
     if solver == "brute" or (L + 1) ** m <= 3 ** 12:
-        return _select_bruteforce(alpha, Gamma, c_edit, B, balance, m, L)
+        return _select_bruteforce(alpha, Gamma, rho, B, balance, m, L)
     # No silent degradation: past that, enumeration is infeasible.
     raise RuntimeError(
         f"no exact solver available for m={m}, L={L} (brute force is (L+1)^m); "
         "install gurobipy or use select_mode='greedy'.")
 
 
-# --------------------------------------------------------------------------- #
-# unified interface
-# --------------------------------------------------------------------------- #
-def select_action(alpha, Gamma, mode, B=None, c_edit=0.0, balance=True, L=2,
+def select_action(alpha, Gamma, mode, B=None, lam=0.0, balance=True, L=2,
                   solver="gurobi"):
     """mode in {"greedy","exact"}; returns a in {0,...,L}^m, feasible."""
+    device = alpha.device
+    alpha = alpha.cpu()
+    Gamma = None if Gamma is None else Gamma.cpu()
     m = alpha.shape[0]
+    rho = lam / (2 * m)                  # Algorithm 2, line 1
     if mode == "greedy":
-        return _select_greedy(alpha, c_edit, B, balance, m, L)
-    if mode == "exact":
-        return _select_exact(alpha, Gamma, c_edit, B, balance, m, L, solver)
-    raise ValueError(f"unknown mode {mode!r}")
+        a = _select_greedy(alpha, rho, B, balance, m, L)
+    elif mode == "exact":
+        a = _select_exact(alpha, Gamma, rho, B, balance, m, L, solver)
+    else:
+        raise ValueError(f"unknown mode {mode!r}")
+    return a.to(device)
