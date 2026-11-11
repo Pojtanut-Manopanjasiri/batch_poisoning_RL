@@ -14,7 +14,7 @@ import experiment as ex
 from env import Environment
 
 ABOUT = ("pred[policy][k]: predictions on the test points of the victim model left after test episode episodes[k] "
-         "(initial, target: the victim's start and the attack target, one row each); prob: P(label = 1), "
+         "(initial, target, star: the victim's start, the attack target and theta*, one row each); prob: P(label = 1), "
          "logistic only; features and labels as the victim sees them (standardised for real datasets)")
 
 

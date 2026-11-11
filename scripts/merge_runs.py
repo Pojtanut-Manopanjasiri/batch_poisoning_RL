@@ -26,6 +26,8 @@ def merge(recs):
             r = fits[(n, s)]
             run["costs"][n], run["profile"][n], run["victim"][n] = r["cost"], r["profile"], r["victim"]
             run["hist"][n], run["times"][n], run["logs"][n], run["params"][n] = r["hist"], r["time"], r["log"], r["params"]
+            for k, e in r.get("extra", {}).items():       # test-only variants, e.g. FEVI-exact
+                run["costs"][k], run["profile"][k], run["victim"][k] = e["cost"], e["profile"], e["victim"]
         runs.append(run)
     r0, first = refs[seeds[0]], {n: fits[(n, seeds[0])] for n in learners}
     return {"ecfg": r0["ecfg"], "lam": r0["cfg"].lam, "seeds": tuple(seeds),

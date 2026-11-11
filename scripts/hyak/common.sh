@@ -1,4 +1,4 @@
-# Helpers sourced by submit.sh, sweep.sh and setup_env.sh.
+# Helpers sourced by submit.sh, sweep.sh, lam_sweep.sh and setup_env.sh.
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 
@@ -42,6 +42,7 @@ shared_args() {  # victim, attack, budget and network flags for every job
     a+=" --task $TASK --d $D --noise $NOISE --theta_star_norm $THETA_STAR_NORM"
   fi
   a+=" --train_episodes $TRAIN_EPISODES --N_episodes $EPISODES_PER_ITER --eval_episodes $EVAL_EPISODES"
+  [[ $FEVI_EXACT_TEST == true ]] && a+=" --exact_test"
   echo "$a --hidden $HIDDEN --weight_decay $WEIGHT_DECAY --myopic_prior $MYOPIC_PRIOR${EXTRA:+ $EXTRA}"
 }
 
@@ -95,12 +96,17 @@ prepare_run() {  # arg: function printing the job lines -> JOBS file (RUN_DIR/jo
     > "$RUN_DIR/config.sh"
 }
 
-submit_jobs() {  # args: jobs file, command to run once every job succeeded
-  local jobs=$1 then=$2 n id line
-  n=$(wc -l < "$jobs")
-  local sb=(sbatch --parsable --account="$ACCOUNT" --partition="$PARTITION" --time="$TIME" --mem="$MEM"
-            --output="$RUN_DIR/logs/%x_%A_%a.out")
+sbatch_args() {  # arg: run directory -> sb: sbatch with the account, partition and limits, logging there
+  sb=(sbatch --parsable --account="$ACCOUNT" --partition="$PARTITION" --time="$TIME" --mem="$MEM"
+      --output="$1/logs/%x_%A_%a.out")
   [[ -n $CONSTRAINT ]] && sb+=(--constraint="$CONSTRAINT")
+  return 0
+}
+
+submit_jobs() {  # args: jobs file, command to run once every job succeeded
+  local jobs=$1 then=$2 n id line sb
+  n=$(wc -l < "$jobs")
+  sbatch_args "$RUN_DIR"
   case $MODE in
     dry)
       cat "$jobs"
@@ -116,7 +122,7 @@ submit_jobs() {  # args: jobs file, command to run once every job succeeded
       echo "$then" > "$RUN_DIR/then.txt"
       id=$("${sb[@]}" --job-name="$RUN_NAME" --array=0-$((n - 1))%"$MAX_PARALLEL" "$HERE/array.slurm" "$jobs")
       "${sb[@]}" --job-name="${RUN_NAME}_then" --dependency=afterok:"$id" --array=0 \
-        "$HERE/array.slurm" "$RUN_DIR/then.txt" > /dev/null
+        "$HERE/array.slurm" "$RUN_DIR/then.txt" > "$RUN_DIR/then.jobid"     # lam_sweep.sh waits on it
       echo "submitted $n jobs as array $id (+ follow-up); logs in $RUN_DIR/logs; watch with: squeue -u $USER" ;;
   esac
 }

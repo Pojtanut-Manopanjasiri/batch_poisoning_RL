@@ -16,35 +16,39 @@ from fvi import train_fevi, evaluate, rollout
 from trpo import train_trpo, TRPOAgent, StateValue, PriorAllocationPolicy, max_swaps
 
 LEARNERS = ("FEVI", "BDQ", "TRPO")
+FEVI_EXACT = "FEVI-exact"                        # FEVI's value net tested with exact (MIQP) action selection
 TRAIN = {"FEVI": train_fevi, "BDQ": train_bdq, "TRPO": train_trpo}
 ETA_GRID = (0.01, 0.03, 0.1, 0.2, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0)
 TEST_POINTS, TEST_SEED = 10000, 1000             # synthetic victims' clean test set
 
 
 def heldout_metrics(env, agent, rng, n_episodes):
+    """-> mean episode cost, per-step perturbation and distance to target, and each episode's final victim."""
     cost = pert = gap = 0.0
-    steps = 0
+    steps, finals = 0, []
     for _ in range(n_episodes):
-        _, c, trace = rollout(env, agent, rng, trace=True)
+        tr, c, trace = rollout(env, agent, rng, trace=True)
         cost += c
         for st in trace:
             pert += sum(abs(v - 1) for v in st["action"])
             gap += st["dist_to_target"]
             steps += 1
-    return cost / n_episodes, pert / steps, gap / steps
+        finals.append(tr[-1][3])
+    return cost / n_episodes, pert / steps, gap / steps, torch.stack(finals)
 
 
 @contextmanager
-def track_heldout(log):
+def track_heldout(log, data):
     start, in_eval = time.perf_counter(), [0.0]
 
     def evaluate_logged(env, agent, rng, n_episodes=100):
         t0 = time.perf_counter()
         log["time"].append(t0 - start - in_eval[0])      # training seconds so far
-        c, p, g = heldout_metrics(env, agent, rng, n_episodes)
+        c, p, g, finals = heldout_metrics(env, agent, rng, n_episodes)
         log["cost"].append(c)
         log["pert"].append(p)
         log["gap"].append(g)
+        log["quality"].append(victim_quality(env, finals, data))     # validation victims on clean data
         in_eval[0] += time.perf_counter() - t0
         return c
 
@@ -57,7 +61,7 @@ def track_heldout(log):
 
 
 def step_profile(env, agent, n_episodes, seed):
-    """-> per-step means and per-episode costs, and each episode's final victim model (n_episodes, D)."""
+    """-> per-step means and per-episode costs, and each episode's victim after every step (n_episodes, T, D)."""
     rng = torch.Generator().manual_seed(seed)
     runs = [rollout(env, agent, rng, trace=True) for _ in range(n_episodes)]
     eps = [r[2] for r in runs]
@@ -66,7 +70,7 @@ def step_profile(env, agent, n_episodes, seed):
     gap = np.array([[st["dist_to_target"] for st in ep] for ep in eps])
     prof = {"cum": cost.cumsum(1).mean(0).tolist(), "pert": pert.mean(0).tolist(),
             "gap": gap.mean(0).tolist(), "ep": cost.sum(1).tolist()}     # ep: per-episode, for paired CIs
-    return prof, torch.stack([r[0][-1][3] for r in runs])
+    return prof, torch.stack([torch.stack([tr[3] for tr in r[0]]) for r in runs])
 
 
 def test_set(env):
@@ -97,6 +101,17 @@ def victim_stats(env, thetas, data):
     return {k: v.detach().cpu().numpy() if torch.is_tensor(v) else v for k, v in s.items()}
 
 
+def victim_quality(env, thetas, data):
+    """victim_stats without the models, plus each model's distance to theta* (nan for mlp) and to the target."""
+    s = victim_stats(env, thetas, data)
+    del s["theta"]
+    star = env.stream.theta_star.to(thetas)
+    s["star_dist"] = ((thetas - star).norm(dim=1) if thetas.shape[1] == len(star)
+                      else torch.full((len(thetas),), float("nan"))).cpu().numpy()
+    s["target_dist"] = (thetas - env.theta_target).norm(dim=1).cpu().numpy()
+    return s
+
+
 def victim_scores(s):
     """victim_stats -> per-model accuracy/precision/recall/f1 or mse/mae/rmse/r2 (nan when undefined)."""
     if "tp" in s:
@@ -116,10 +131,11 @@ def learner_cfg(name, cfg, **hp):
 
 def train_learner(name, env, cfg, seed, eval_episodes, val_seed):
     """-> (net, validation history, held-out log, training seconds); best checkpoint on val_seed."""
-    log = {"cost": [], "pert": [], "gap": [], "time": []}
+    log = {"cost": [], "pert": [], "gap": [], "time": [], "quality": []}
+    data = test_set(env)
     torch.manual_seed(seed)
     t0 = time.perf_counter()
-    with track_heldout(log):
+    with track_heldout(log, data):
         net, hist = TRAIN[name](env, cfg, seed=seed, verbose=False, return_history=True,
                                 best_checkpoint=True, eval_episodes=eval_episodes, eval_seed=val_seed)
     secs = time.perf_counter() - t0
@@ -150,14 +166,24 @@ def evaluate_agents(env, agents, n_episodes, eval_seed, val_seed):
     """-> test costs, null/greedy learning-curve reference lines, per-step profiles, victim stats on clean data."""
     costs = {n: float(evaluate(env, a, torch.Generator().manual_seed(eval_seed), n_episodes))
              for n, a in agents.items()}
-    ref = {n: list(heldout_metrics(env, agents[n], torch.Generator().manual_seed(val_seed), n_episodes))
-           for n in ("null", "greedy") if n in agents}
+    ref, val = {}, {}
+    for n in ("null", "greedy"):
+        if n in agents:                               # learning-curve references, on the validation episodes
+            *ref[n], val[n] = heldout_metrics(env, agents[n], torch.Generator().manual_seed(val_seed), n_episodes)
     data = test_set(env)
     profile, victim = {}, {"initial": victim_stats(env, env.theta_0[None], data),
                            "target": victim_stats(env, env.theta_target[None], data)}
+    if env.stream.theta_star.numel() == env.d:        # theta*: the true parameter (datasets: least squares)
+        victim["star"] = victim_stats(env, env.stream.theta_star.to(env.device)[None], data)
     for n, a in agents.items():                       # victim[n]: the models left after each test episode
-        profile[n], thetas = step_profile(env, a, n_episodes, eval_seed)
-        victim[n] = victim_stats(env, thetas, data)
+        profile[n], paths = step_profile(env, a, n_episodes, eval_seed)
+        victim[n] = victim_stats(env, paths[:, -1], data)
+        victim[n]["theta_path"] = paths.detach().cpu().numpy()     # victim after each step t = 1..T
+        E, T, D = paths.shape
+        victim[n]["path"] = {k: v.reshape(E, T) if np.ndim(v) else v
+                             for k, v in victim_quality(env, paths.reshape(-1, D), data).items()}
+    for n, finals in val.items():                     # the references' validation victims
+        victim[n]["val"] = victim_quality(env, finals, data)
     for n in agents:
         assert np.isclose(profile[n]["cum"][-1], costs[n])   # J(T-1) = test episode cost
     return costs, ref, profile, victim

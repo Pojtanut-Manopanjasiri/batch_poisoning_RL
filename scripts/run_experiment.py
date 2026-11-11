@@ -50,6 +50,8 @@ def build_parser():
     p.add_argument("--score_seed", type=int, default=997, help="tuning-score episodes")
     p.add_argument("--tag", default="", help="config label within a sweep, e.g. c3")
     p.add_argument("--trials", type=int, default=0, help="tuning runs behind these hyperparameters")
+    p.add_argument("--exact_test", action="store_true",
+                   help="fevi: also test its value net with exact action selection, as policy FEVI-exact")
     p.add_argument("--hp", action="append", default=[], metavar="KEY=VALUE",
                    help="MethodConfig override for this learner only (repeatable)")
     p.add_argument("--out", required=True, help="output pickle; the job is skipped if it exists")
@@ -129,9 +131,13 @@ def main():
         if args["tune"]:
             rec["score"] = score(agent)
         else:
-            costs, _, profile, models = ex.evaluate_agents(env, {n: agent}, n_eval, args["eval_seed"],
-                                                           args["val_seed"])
+            agents = {n: agent}
+            if args["exact_test"] and n == "FEVI":       # same value net; the selection keeps the quadratic term
+                agents[ex.FEVI_EXACT] = ex.learner_agent(n, net, env, replace(lcfg, select_mode="exact"), seed)
+            costs, _, profile, models = ex.evaluate_agents(env, agents, n_eval, args["eval_seed"], args["val_seed"])
             rec["cost"], rec["profile"], rec["victim"] = costs[n], profile[n], models[n]
+            rec["extra"] = {k: {"cost": costs[k], "profile": profile[k], "victim": models[k]}
+                            for k in agents if k != n}    # test-only variants of this learner
         rec["params"] = ex.n_params(n, net, env, lcfg)
         summary = {n: rec.get("score", rec.get("cost")), "train_s": rec["time"]}
 

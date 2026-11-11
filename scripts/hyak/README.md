@@ -60,18 +60,45 @@ points, their true labels, and each policy's predictions from the models left af
 with `j = json.load(open(...)); pd.DataFrame(j["features"])`. To export more episodes later:
 `python scripts/export_predictions.py results/hyak/<RUN_NAME> --episodes all`.
 
-## Loading the results in the notebook
+## Edit-cost sweep
 
+```bash
+bash scripts/hyak/lam_sweep.sh scripts/hyak/examples/mlp.sh SEEDS=0-4          # add --dry-run to preview
+```
+
+- Submits one full run (`submit.sh`) per value in `LAMS`, each in `results/hyak/<RUN_NAME>_lam<value>/`.
+- Each FEVI job also tests its value network with exact action selection, saved as the policy `FEVI-exact`.
+  It is a test-time variant: training and checkpoint selection still use FEVI's first-order selection.
+  `FEVI_EXACT_TEST=true` adds it to any `submit.sh` run.
+- When every run has been merged, a last job writes `results/hyak/<RUN_NAME>_lam/`: `lam_summary.csv` and
+  `cost_vs_lambda_<victim>.pdf/.png`; the tables are in that folder's `logs/`.
+- Raw cost rises with lambda for every policy, because lambda prices the edits. Compare the policies at the
+  same lambda: cost relative to null and to greedy, and the distance part of the cost.
+- Hyperparameters are the ones in the config (or `HP_FROM`) at every lambda; they are not re-tuned per value.
+
+## Plotting the results
+
+[notebooks/results.ipynb](../../notebooks/results.ipynb) only reads results; it never trains. By default it loads
+every merged pickle under `results/hyak/`. Set `RESULT_FILES` to choose others, `METRIC` to pick the victim's score
+(accuracy/precision/recall/F1 or MSE/MAE/RMSE/R²) and `DIST_TO` for ‖θ − θ*‖ or ‖θ − θ̃‖. Pickles from older code
+still give the cost plots; the victim-quality plots need results from the current code.
+
+To use the training notebooks' result cells instead:
 1. Copy the merged pickle back: `rsync klone:<repo>/results/hyak/<RUN_NAME>/*.pkl results/victims/`.
    Real datasets go in `results/real/`.
 2. In the notebook, set `OVERWRITE = False` so the training cell skips any victim that already has a
    pickle, then run all cells.
 3. The settings in the notebook's `VICTIMS` must give the same file name (task, m, T, gamma, lambda) as the run.
 
-**Victim quality after the attack:** each seed's `runs[i]["victim"][policy]` holds each test episode's final model
-`theta` and its scores on clean data (real datasets: a held-out share, `DATASET_TEST`): confusion counts
-(logistic) or error sums (regression, mlp).
-`experiment.victim_scores(...)` turns them into accuracy/precision/recall/F1 or MSE/MAE/RMSE/R², one per episode.
+**Victim quality after the attack** is always measured on clean data (real datasets: a held-out share,
+`DATASET_TEST`). It is saved as confusion counts (logistic) or error sums (regression, mlp), together with the
+distance to θ* (`star_dist`, none for mlp) and to the target (`target_dist`). In each seed's `runs[i]`:
+- `["victim"][policy]`: each test episode's final model `theta` and its counts; `["path"]` holds the same after
+  every step; `null` and `greedy` also have `["val"]`, from their validation episodes.
+- `["victim"]["initial" | "target" | "star"]`: θ₀, θ̃ and θ* (the datasets' θ* is the least-squares fit).
+- `["logs"][learner]["quality"]`: the validation victims at each training checkpoint.
+
+`experiment.victim_scores(...)` turns the counts into accuracy/precision/recall/F1 or MSE/MAE/RMSE/R², one per model.
 
 ## When something fails
 

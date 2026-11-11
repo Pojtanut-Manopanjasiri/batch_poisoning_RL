@@ -17,6 +17,8 @@ SEEDS=0-9                          # training seeds: "0-9", "0 3 7" or "0-4 9"
 LEARNERS="fevi bdq trpo"
 RESULT_SUFFIX=_fair                # merged file-name suffix (experiment.ipynb: _fair, experiment_real.ipynb: empty)
 EXPORT_EPISODES=1                  # predictions JSON for each policy's first N test-episode victims; all; 0 = none
+FEVI_EXACT_TEST=false              # true: also test FEVI's value net with exact action selection (policy FEVI-exact)
+LAMS="0 0.01 0.03 0.1 0.2 0.3 0.5 1.0"   # lam_sweep.sh: one run per edit-cost weight, in ${RUN_NAME}_lam<value>
 
 # --- Victim
 TASK=regression                    # regression | logistic | mlp (neural-net victim; datasets infer it unless mlp)
